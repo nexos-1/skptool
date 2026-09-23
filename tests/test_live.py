@@ -67,6 +67,12 @@ def _blender_pids():
 
 
 class TestClientWithoutBlender(unittest.TestCase):
+    def _state(self, data):
+        """Statusdatei so anlegen wie der echte Server: nur fuer den eigenen Benutzer lesbar (0600).
+        Unter Linux und macOS lehnt der Client sonst jede Datei zu Recht als nicht privat ab."""
+        self.state.write_text(json.dumps(data), encoding="utf-8")
+        os.chmod(self.state, 0o600)
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="skptool_live_"))
         self.state = self.tmp / "live.json"
@@ -84,7 +90,7 @@ class TestClientWithoutBlender(unittest.TestCase):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()  # Port ist jetzt frei, niemand hoert zu
-        self.state.write_text(json.dumps({"port": port, "token": "t" * 43, "pid": 1}), encoding="utf-8")
+        self._state({"port": port, "token": "t" * 43, "pid": 1})
         with self.assertRaises(live.LiveError) as cm:
             live.status(self.state)
         self.assertIn("Kein Live-Blender aktiv", str(cm.exception))
@@ -133,14 +139,24 @@ class TestClientWithoutBlender(unittest.TestCase):
         th = threading.Thread(target=fake, daemon=True)
         th.start()
         token = "geheimes-token-" + "x" * 30
-        self.state.write_text(json.dumps({"port": srv.getsockname()[1], "token": token, "pid": 1}), encoding="utf-8")
+        self._state({"port": srv.getsockname()[1], "token": token, "pid": 1})
         with self.assertRaises(live.LiveError):
             live.screenshot(self.tmp / "bild.png", state=self.state)
         th.join(10)
         srv.close()
         self.assertEqual(victim.read_text(), "bleibt")
         self.assertFalse((self.tmp / "bild.png").exists())
+        self.assertEqual(len(seen), 1, "der falsche Server wurde gar nicht angesprochen")
         self.assertNotIn(token.encode(), seen[0])  # das Token ging nie ueber die Leitung
+
+    @unittest.skipIf(os.name == "nt", "Dateirechte 0644 gibt es nur unter Linux und macOS")
+    def test_state_file_readable_by_others_is_refused(self):
+        self.state.write_text(json.dumps({"port": 1, "token": "t" * 43, "pid": 1}), encoding="utf-8")
+        os.chmod(self.state, 0o644)
+        with self.assertRaises(live.LiveError) as cm:
+            live.status(self.state)
+        self.assertIn("nicht privat", str(cm.exception))
+        self.assertTrue(self.state.exists())  # eine fremde Datei wird nie geloescht
 
     def test_bad_ops_json_is_rejected_before_sending(self):
         with self.assertRaises(SystemExit):
