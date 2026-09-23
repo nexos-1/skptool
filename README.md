@@ -33,11 +33,13 @@ python -m venv .venv
 
 `requirements.lock` enthält Prüfsummen für jedes Paket, so kann bei der Installation nichts untergeschoben werden. Unter macOS und Linux heißt der Pfad `.venv/bin/python`.
 
-Aufruf unter Windows über `skptool.cmd` im Projektordner, von jedem Ordner aus. Unter macOS und Linux:
+Aufruf unter Windows über `skptool.cmd` im Projektordner. Damit `skptool` in jedem Ordner funktioniert, ohne den PATH zu ändern:
 
 ```bash
-PYTHONPATH=/pfad/zu/skptool /pfad/zu/skptool/.venv/bin/python -P -m skptool --help
+.venv\Scripts\python tools\aufruf_einrichten.py --ja
 ```
+
+Das legt einen kleinen Starter in `%USERPROFILE%\.local\bin` an (unter macOS und Linux `~/.local/bin/skptool`). Dieser Ordner steht meist schon im PATH, etwa durch uv. Ohne `--ja` zeigt das Skript nur, was es tun würde. `--ziel` wählt einen anderen Ordner, `--entfernen --ja` löscht den Starter wieder, fremde Dateien werden nie überschrieben. Danach ein neues Terminal öffnen und `skptool --version` testen.
 
 Blender wird in den üblichen Installationsordnern gefunden, sonst `SKPTOOL_BLENDER` auf den Pfad setzen oder `--blender` angeben. Aus dem aktuellen Ordner wird Blender nie gestartet.
 
@@ -73,6 +75,18 @@ skptool render haus.skp -o vorschau.png
 
 Vorschaubild ohne Fenster.
 
+```bash
+skptool report "projekte\*.skp"
+```
+
+Sammelbericht über viele Dateien: je Datei Version, gespeicherte und platzierte Flächen, Komponenten, Ebenen, Materialien (mit Textur, getönt, transparent), Texturen (Anzahl, Größe, längste Kante, nur aus dem Bildkopf gelesen) und Einlesezeit, dazu Warnungen, was beim Umwandeln verloren gehen kann (getönte Texturen, Szenen, Bemaßungen, Texte, Schnittebenen, dynamische Komponenten, Materialien gleicher Farbe, sehr große Dateien und Texturen, Version 2019 oder sehr alt). Nicht lesbare Dateien werden eine Fehlerzeile, der Lauf geht weiter, der Rückgabewert ist dann 1. `--json` liefert ein Dokument für alle Dateien, `--csv` eine Tabelle für Excel (Semikolon, mit Schutz gegen eingeschleuste Formeln), `--html` eine eigenständige Seite ohne Skripte. `-o bericht.html` schreibt in eine Datei, ohne Schalter bestimmt die Endung das Format. `--bounds` berechnet auch die Abmessungen, `--rekursiv` durchsucht mit `"projekte\**\*.skp"` auch Unterordner.
+
+```bash
+skptool diff haus.skp haus_bearbeitet.skp
+```
+
+Vergleicht zwei `.skp`-Dateien: Ebenen, Materialien (Farbe, Deckkraft, Textur), Komponenten und Gruppen sowie jede Platzierung mit ihrer Lage im Raum ("verschoben um 12 mm", "gedreht oder skaliert"). Gruppen werden über ihren Inhalt zugeordnet, weil sich ihre Nummern beim Umschreiben ändern. `--geometrie` vergleicht alle platzierten Punkte, `--texturen` die Texturlage (beide brauchen viel Arbeitsspeicher). `--toleranz` in mm (Standard 0,1), `--nur ebenen,materialien,definitionen,platzierungen`, `--all` vollständig, `--json` maschinenlesbar, `-q` nur Rückgabewert: 0 gleich, 1 verschieden, 2 Fehler. Gedacht zum Prüfen einer Rundreise, etwa `skptool diff haus.skp haus_zurueck.skp --geometrie`.
+
 Weitere Schalter: `-v` zeigt die Zeit jedes Blender-Schritts. `.skp`-Ausgaben werden zur Kontrolle neu eingelesen, standardmäßig bis 100 MB (`--verify` immer, `--no-verify` nie). `--allow-external` übernimmt lokale Dateien, auf die eine fremde Eingabe verweist (siehe [Sicherheit](#sicherheit)).
 
 ### Bearbeiten per Befehl
@@ -87,7 +101,7 @@ Objekte mit Ebene, Größe und Materialien. Filter: `--name` (Muster mit `*`), `
 skptool edit haus.skp -o haus_neu.skp --ops aenderungen.json
 ```
 
-Wendet eine Liste von Operationen an und schreibt das Ergebnis in jedem Ausgabeformat. `--ops` nimmt eine `.json`-Datei oder JSON-Text:
+Wendet eine Liste von Operationen an und schreibt das Ergebnis in jedem Ausgabeformat. `--ops` nimmt eine `.json`-Datei, JSON-Text oder `-` für die Standardeingabe:
 
 ```json
 [
@@ -100,13 +114,15 @@ Wendet eine Liste von Operationen an und schreibt das Ergebnis in jedem Ausgabef
 
 Operationen: `list`, `summary`, `move`, `rotate`, `scale`, `set_material`, `recolor`, `set_layer`, `hide_layer`, `show_layer`, `delete`, `rename`, `duplicate`, `add_box`. Einheiten sind Meter und Grad, z zeigt nach oben. Die genaue Beschreibung steht in [`ops.py`](skptool/blender_scripts/ops.py). Keine Operation führt Code aus oder greift auf Dateien zu. Schlägt eine Operation fehl, wird nichts geschrieben.
 
+**Windows PowerShell 5.1:** JSON-Text in Anführungszeichen (`--ops '[...]'`) kommt dort kaputt an, weil PowerShell die inneren Anführungszeichen entfernt. Dort eine `.json`-Datei verwenden oder die Datei übergeben: `Get-Content aenderungen.json -Raw | skptool edit haus.skp -o haus_neu.skp --ops -`. Für Umlaute in Namen vorher `$OutputEncoding = [Text.Encoding]::UTF8` setzen. PowerShell 7, cmd und Bash sind nicht betroffen.
+
 ### Live im offenen Blender
 
 ```bash
 skptool open haus.skp --live
 ```
 
-Startet Blender mit einer lokalen Verbindung. Befehle wirken sofort im offenen Fenster, jeder Aufruf ist ein eigener Schritt für Strg+Z:
+Startet Blender mit einer lokalen Verbindung. Befehle wirken sofort im offenen Fenster, jeder Aufruf ist ein eigener Schritt für Strg+Z (unter Windows PowerShell 5.1 `--ops` wie oben als Datei oder mit `-` übergeben):
 
 ```bash
 skptool live --ops '[{"op": "move", "select": {"name": "Stuhl*"}, "by": [0, 0, 1]}]'
@@ -203,7 +219,7 @@ Die Zeit steckt fast vollständig im Einlesen durch OpenSKP in Python. Die Optim
 .venv\Scripts\python -m unittest discover -s tests -v
 ```
 
-69 Tests in `tests/test_skptool.py`, `tests/test_live.py` und `tests/test_sicherheit.py`. Die Live-Tests öffnen kurz ein kleines Blender-Fenster, `SKPTOOL_SKIP_GUI_TESTS=1` überspringt das. Ohne Blender werden die Blender-Tests übersprungen.
+145 Tests in `tests/`: Grundfunktionen, Sicherheit, Live-Modus, `diff`, `report`, Aufruf von überall, OpenSKP-Vertrag und Stil. Die Live-Tests öffnen kurz ein kleines Blender-Fenster, `SKPTOOL_SKIP_GUI_TESTS=1` überspringt das. Ohne Blender werden die Blender-Tests übersprungen.
 
 Einige Tests brauchen zwei zusätzliche Beispieldateien aus dem OpenSKP-Repository. Sie enthalten Inhalte Dritter und liegen deshalb nicht bei. Laden (fester Stand, per SHA-256 geprüft):
 
@@ -226,7 +242,9 @@ Ohne sie werden diese Tests übersprungen.
 | `skptool/blender_scripts/ops.py` | Bearbeitungsoperationen für `edit` und den Live-Modus |
 | `skptool/live.py`, `skptool/blender_scripts/live_server.py` | die beiden Seiten des Live-Modus |
 | `skptool/opsjson.py` | liest und prüft `--ops` |
-| `tools/` | Hilfsskripte: Texturvergleich, Geometrievergleich, Verschachtelung als Baum, Texturtestszene, Beispiele laden |
+| `skptool/vergleich.py` | `skptool diff`, auch Grundlage für den Geometrie- und Texturvergleich in `tools/` |
+| `skptool/bericht.py` | `skptool report` |
+| `tools/` | Hilfsskripte: Aufruf von überall einrichten, Texturvergleich, Geometrievergleich, Verschachtelung als Baum, Texturtestszene, Beispiele laden |
 
 ## Versionen
 

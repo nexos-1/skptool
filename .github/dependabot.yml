@@ -1,0 +1,10 @@
+# Nur die GitHub-Actions aktuell halten. Neue Versionen fruehestens nach 14 Tagen vorschlagen
+# (Schutz vor frisch kompromittierten Versionen). Python-Pakete werden bewusst von Hand gepinnt.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 14

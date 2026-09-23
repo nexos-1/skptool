@@ -11,7 +11,7 @@ Bitte Sicherheitslücken **nicht** als öffentliches Issue melden, sondern vertr
 **Fremde Dateien**
 
 - Aus Dateien wird nie Code ausgeführt. Blender läuft immer mit abgeschalteter Skriptausführung (`-Y`), im Hintergrund zusätzlich mit Werkseinstellungen.
-- **Netzwerkpfade** (`\\server\freigabe`, `//server/...`, `file://server/...`) in `.blend`, glTF/GLB, OBJ/MTL, USD, FBX, Alembic und DAE führen immer zur Ablehnung, und zwar bevor Blender die Datei öffnet. Unter Windows würde schon der Zugriff die Anmeldedaten (NTLM-Hash) an den fremden Server senden.
+- **Netzwerkpfade** (`\\server\freigabe`, `//server/...`, `file://server/...`) in `.blend`, glTF/GLB, OBJ/MTL, USD, FBX und Alembic führen immer zur Ablehnung, und zwar bevor Blender die Datei öffnet. Unter Windows würde schon der Zugriff die Anmeldedaten (NTLM-Hash) an den fremden Server senden.
 - **Externe Dateien** werden standardmäßig nicht übernommen. Eine fremde Datei könnte sonst beliebige Bilder oder Daten dieses Rechners in eine Ausgabe ziehen, die man weitergibt. Nur mit `--allow-external` werden lokale externe Dateien verwendet. Das betrifft Bilder, verlinkte `.blend`-Bibliotheken, Caches, Schriften, Dateipfade in Modifikatoren und Import-Knoten in Geometry Nodes.
 - Auch vor dem Öffnen einer `.blend` im Blender-Fenster (`skptool open`, `--live`) wird geprüft: Netzwerkpfade nie, externe Dateien nur mit `--allow-external`.
 - ZIP-Container (`.skp` ab 2021, `.usdz`) werden vor dem Lesen begrenzt: höchstens 8 GB entpackt, 100.000 Einträge, Kompressionsverhältnis 100. Explodierende Verschachtelungen stoppen bei 5 Millionen Platzierungen, übergroße Texturen werden nur anhand ihres Kopfes erkannt und nicht dekodiert.
@@ -26,7 +26,8 @@ Bitte Sicherheitslücken **nicht** als öffentliches Issue melden, sondern vertr
 
 **Programmstart**
 
-- `skptool.cmd` lädt nie Python-Module aus dem aktuellen Ordner, und Blender wird nie aus dem aktuellen Ordner gestartet. Eine `glob.py` oder `blender.bat` neben einem heruntergeladenen Modell bleibt wirkungslos.
+- `skptool.cmd` lädt nie Python-Module aus dem aktuellen Ordner, und Blender wird nie aus dem aktuellen Ordner gestartet. Eine `glob.py` oder `blender.bat` neben einem heruntergeladenen Modell bleibt wirkungslos. Der Starter behält aus einem geerbten `PYTHONPATH` nur absolute Pfade, Python läuft mit `-P`, und `skptool` entfernt beim Import zusätzlich jeden Suchpfad, der auf den aktuellen Ordner zeigt.
+- Der Starter aus `tools/aufruf_einrichten.py` ruft nur den `skptool.cmd` dieses Projekts mit absolutem Pfad auf und überschreibt keine fremden Dateien.
 - Alle Abhängigkeiten sind mit Prüfsummen gepinnt (`requirements.lock`), auf Versionen, die bei der Erstellung mindestens 14 Tage veröffentlicht waren.
 
 **Bearbeitung (`edit`, `live --ops`)**
@@ -46,4 +47,5 @@ Bitte Sicherheitslücken **nicht** als öffentliches Issue melden, sondern vertr
 
 - **Blender und OpenSKP lesen die Dateien.** Fehler in deren Lesern (etwa Speicherfehler in einem Importer) liegen außerhalb von `skptool`. Für fremde Dateien gilt deshalb dasselbe wie beim Öffnen in Blender selbst.
 - Bei binären FBX- und Alembic-Dateien sucht `skptool` Netzwerkpfade im Dateiinhalt. Ein Pfad, der in komprimierten Blöcken versteckt ist, wird so nicht gefunden. `.blend` (auch komprimiert), glTF, OBJ/MTL und USD werden dagegen vollständig geprüft.
-- Unter Linux und macOS ist `skptool` nicht getestet.
+- **cmd.exe** sucht Befehle zuerst im aktuellen Ordner. Wer `skptool` in cmd in einem fremden Ordner tippt, bekäme dort eine `skptool.cmd` oder `skptool.bat` zuerst. PowerShell durchsucht den aktuellen Ordner nicht. In cmd hilft die Umgebungsvariable `NoDefaultCurrentDirectoryInExePath=1`.
+- Unter Linux und macOS laufen die Tests ohne Blender in der CI, mit Blender ist `skptool` dort nicht getestet.

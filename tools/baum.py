@@ -7,26 +7,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from skptool import core  # noqa: E402
+from skptool.vergleich import baum_zeilen  # noqa: E402
 
 
 def tree(model, max_depth=4):
-    lines = []
-
-    def walk(defn, depth, label):
-        lines.append(f"{'  ' * depth}{label}: {len(defn.faces)} Flaechen, {len(defn.instances)} Platzierungen")
-        if depth >= max_depth:
-            return
-        groups = {}
-        for inst in defn.instances:
-            groups.setdefault(inst.ref_idx, []).append(inst)
-        for ref, insts in groups.items():
-            d = model.definitions.get(ref)
-            if d is None:
-                continue
-            walk(d, depth + 1, f"{len(insts)}x {d.name!r}")
-
-    walk(model.root, 0, "Modell")
-    return lines
+    return baum_zeilen(model, max_depth)
 
 
 if __name__ == "__main__":

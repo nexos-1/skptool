@@ -408,7 +408,7 @@ def add_live_parser(sub) -> None:
                        description="Steuert ein mit 'skptool open <datei> --live' gestartetes Blender. "
                                    "Mehrere Schalter gehen zusammen, Reihenfolge: ops, undo, save, export, "
                                    "screenshot, status, quit.")
-    p.add_argument("--ops", help="Operationen als JSON-Text oder .json-Datei (wie bei edit)")
+    p.add_argument("--ops", help="Operationen als JSON-Text, .json-Datei oder - fuer stdin (wie bei edit)")
     p.add_argument("--keep-going", action="store_true", help="Bei fehlerhafter Operation weitermachen")
     p.add_argument("--undo", type=int, nargs="?", const=1, help="Letzte(n) Schritt(e) rueckgaengig machen")
     p.add_argument("--save", action="store_true", help=".blend speichern (loest den .skp-Export aus)")
