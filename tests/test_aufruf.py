@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from skptool import __version__
+
 ROOT = Path(__file__).resolve().parents[1]
 SKRIPT = ROOT / "tools" / "aufruf_einrichten.py"
 S2017 = ROOT / "samples" / "stuhl_tisch_2017.skp"
@@ -225,7 +227,7 @@ class TestStarterVonUeberall(Tmp):
             r = self.starten("--version", via_name=via_name)
             self.assertEqual(self.gepwnt(), [], via_name)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("skptool 0.1.0", r.stdout)
+            self.assertIn(f"skptool {__version__}", r.stdout)
 
     def test_starter_mit_boesem_pythonpath(self):
         for pp in (";.", ".", ";;", ".;.\\;relativ;C:rel", ";.;..\\modell mit & zeichen"):
@@ -233,7 +235,7 @@ class TestStarterVonUeberall(Tmp):
                 r = self.starten("--version", via_name=via_name, PYTHONPATH=pp)
                 self.assertEqual(self.gepwnt(), [], pp)
                 self.assertEqual(r.returncode, 0, (pp, r.stderr))
-                self.assertIn("skptool 0.1.0", r.stdout)
+                self.assertIn(f"skptool {__version__}", r.stdout)
 
     def test_absoluter_pythonpath_bleibt_nutzbar(self):
         extra = self.tmp / "extra & mehr!"

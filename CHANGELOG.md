@@ -4,6 +4,16 @@ Format nach [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), Versionen 
 
 ## [Unveröffentlicht]
 
+### Noch offen (geplant für die nächsten Versionen)
+
+- **OpenSKP 1.3.0:** Upgrade angefangen, noch nicht geprüft und nicht enthalten. Bringt die neue Abhängigkeit `mapbox-earcut` mit und liest vermutlich auch sehr alte Dateien (SketchUp 7 und älter). Vor der Übernahme: Quellcode-Prüfung, volle Testsuite, Vergleich alt gegen neu mit `skptool diff`.
+- **Materialien gleicher Farbe** werden beim Import nach Blender noch verwechselt (das erste Material mit derselben Farbe gewinnt).
+- **Getönte Texturen** (SketchUp "Einfärben") verlieren beim Umschreiben ihre Tönung.
+- **Noch nicht in echten Programmen geprüft:** 3MF in einem Slicer, der MCP-Server in Claude Code und Claude Desktop, die CSV aus `report` in Excel, der parallele Stapelbetrieb unter Linux und macOS mit echten Dateien.
+- Zwei Live-Tests sind unter starker Last auf dem Rechner unzuverlässig (Latenzgrenze, Zählung fremder Blender-Prozesse).
+
+## [0.2.0] - 2026-09-23
+
 ### Hinzugefügt
 
 - **Verschachtelung beim Rückweg.** Aus der Eltern-Kind-Hierarchie in Blender werden wieder Gruppen in Gruppen und Komponenten in Komponenten. Gleiche Teilbäume teilen sich eine Definition, auch Kopien, die erst in Blender entstanden sind. Wird eine Kopie geändert, bekommt sie eine eigene Definition ("Chair#2"). Benannte SketchUp-Komponenten bleiben Komponenten, Definitionen wie "Group#12" werden wieder Gruppen. Tags an übergeordneten Gruppen bleiben erhalten.
@@ -53,14 +63,6 @@ Ergebnis eines Audits vor der Veröffentlichung. Zu jedem Punkt gibt es einen Te
 - **Dateien:** Der Schutz der Eingabe greift auch bei anderen Schreibweisen desselben Pfads. Der Stapelbetrieb überschreibt keine vorhandenen Dateien und keine eigenen Eingaben mehr. "OK" gibt es nur, wenn die Ausgabe wirklich existiert.
 - **Vorschaubilder** enthalten keine Metadaten mehr (vorher unter anderem den Pfad der `.blend`-Datei).
 - Texturen werden vor dem Dekodieren auf ihre Größe geprüft, `.usdz`-Container wie `.skp` begrenzt.
-
-### Noch offen (geplant für die nächsten Versionen)
-
-- **OpenSKP 1.3.0:** Upgrade angefangen, noch nicht geprüft und nicht enthalten. Bringt die neue Abhängigkeit `mapbox-earcut` mit und liest vermutlich auch sehr alte Dateien (SketchUp 7 und älter). Vor der Übernahme: Quellcode-Prüfung, volle Testsuite, Vergleich alt gegen neu mit `skptool diff`.
-- **Materialien gleicher Farbe** werden beim Import nach Blender noch verwechselt (das erste Material mit derselben Farbe gewinnt).
-- **Getönte Texturen** (SketchUp "Einfärben") verlieren beim Umschreiben ihre Tönung.
-- **Noch nicht in echten Programmen geprüft:** 3MF in einem Slicer, der MCP-Server in Claude Code und Claude Desktop, die CSV aus `report` in Excel, der parallele Stapelbetrieb unter Linux und macOS mit echten Dateien.
-- Zwei Live-Tests sind unter starker Last auf dem Rechner unzuverlässig (Latenzgrenze, Zählung fremder Blender-Prozesse).
 
 ## [0.1.0] - 2026-09-23
 
