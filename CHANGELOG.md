@@ -12,6 +12,12 @@ Format nach [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), Versionen 
 - `--allow-external` für Eingaben, deren Verweise auf lokale Dateien übernommen werden sollen (siehe Sicherheit).
 - `--force` für den Stapelbetrieb.
 - `SECURITY.md`, `LICENSE` (MIT), `THIRD_PARTY.md`, `tests/test_sicherheit.py`.
+- **`skptool diff`** vergleicht zwei `.skp`-Dateien: Ebenen, Materialien, Komponenten, Gruppen und jede Platzierung, auf Wunsch auch Geometrie und Texturlage. Rückgabewert 0 gleich, 1 verschieden, 2 Fehler.
+- **`skptool report`** fasst viele Dateien zusammen, als Text, JSON, CSV (mit Schutz gegen Formeln) oder eigenständiges HTML, mit Warnungen, was beim Umwandeln verloren geht.
+- **Aufruf von überall:** `tools/aufruf_einrichten.py` legt einen Starter in `~/.local/bin` an, ohne den PATH zu ändern.
+- `--ops -` liest die Operationen von der Standardeingabe (für Windows PowerShell 5.1, dort kommt JSON-Text in Anführungszeichen kaputt an).
+- Vertragstests für die genutzten OpenSKP-Interna (`tests/test_openskp_vertrag.py`). Ändert sich OpenSKP, schlagen sie an, statt dass Texturen still falsch liegen. Fehlt eine ersetzte Funktion, bricht `skptool` schon beim Import mit klarer Meldung ab.
+- CI auf GitHub (Windows, Linux, macOS), Vorlagen für Fehlermeldungen und Wünsche.
 - `tools/baum.py` zeigt die Verschachtelung einer `.skp`, `tools/geometrievergleich.py` vergleicht die platzierte Geometrie zweier Dateien, `tools/beispiele_laden.py` lädt zusätzliche Testdateien.
 
 ### Geändert
@@ -21,13 +27,17 @@ Format nach [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), Versionen 
 - Live-Protokoll Version 2: gegenseitige Anmeldung per HMAC statt Token im Klartext.
 - Zwei Beispieldateien mit Inhalten Dritter werden nicht mehr mitgeliefert, sondern bei Bedarf mit `tools/beispiele_laden.py` geladen. Betroffene Tests werden ohne sie übersprungen.
 - Vorschaubilder zeigen jetzt das mitgelieferte Stuhl-Beispiel.
+- Nicht unterstützte Zielformate werden abgelehnt, bevor Blender startet. `.dae` als Ausgabe entfällt (Blender 5 enthält kein Collada mehr, der Weg war erreichbar, aber kaputt).
+- Unter Linux und macOS gelten `/usr/bin`, `/usr/local/bin`, `/opt`, `/snap/bin` und `/Applications` als geschützte Blender-Installationsorte.
+- `tools/geometrievergleich.py` und `tools/texturvergleich.py` brauchen keinen `PYTHONPATH` mehr.
 
 ### Sicherheit
 
 Ergebnis eines Audits vor der Veröffentlichung. Zu jedem Punkt gibt es einen Test.
 
+- **Starter gehärtet:** `skptool.cmd` behält aus einem geerbten `PYTHONPATH` nur absolute Pfade (vorher konnten `;.` oder relative Einträge den aktuellen Ordner wieder einschleusen), und `skptool` entfernt beim Import Suchpfade, die auf den aktuellen Ordner zeigen. Unter Windows sucht `skptool` Blender nicht mehr unter `/usr/bin` und ähnlichen Pfaden, die dort als `C:\usr\bin` von jedem angelegt werden könnten.
 - **Codeausführung aus dem aktuellen Ordner verhindert.** Unter Windows hätte eine `blender.bat` oder `blender.exe` im aktuellen Ordner Vorrang vor dem installierten Blender gehabt, und `skptool.cmd` hätte Python-Module aus dem aktuellen Ordner geladen (leerer `PYTHONPATH`-Eintrag). Beides ist behoben: Blender wird nur aus Installationsordnern oder absoluten `PATH`-Einträgen gestartet, Python läuft mit `-P` ohne den aktuellen Ordner.
-- **Netzwerkpfade** in `.blend`, glTF/GLB, OBJ/MTL, USD, FBX, Alembic und DAE werden vor dem Öffnen erkannt und abgelehnt, auch bevor `skptool open` eine `.blend` im Blender-Fenster öffnet. Unter Windows hätte schon der Zugriff den NTLM-Hash an einen fremden Server gesendet.
+- **Netzwerkpfade** in `.blend`, glTF/GLB, OBJ/MTL, USD, FBX und Alembic werden vor dem Öffnen erkannt und abgelehnt, auch bevor `skptool open` eine `.blend` im Blender-Fenster öffnet. Unter Windows hätte schon der Zugriff den NTLM-Hash an einen fremden Server gesendet.
 - **Keine fremden lokalen Dateien in der Ausgabe.** Eine präparierte glTF-Datei konnte über `../`-Pfade beliebige Bilder dieses Rechners in die Ausgabe ziehen, auch mit `--no-external`. Externe Verweise werden jetzt vor und nach dem Laden geprüft und entfernt, einschließlich Caches, Modifikator-Pfaden und Import-Knoten in Geometry Nodes.
 - **Live-Modus:** Das Token geht nicht mehr über die Leitung, Antworten werden auf Echtheit geprüft (ein fremder Prozess auf dem Port konnte über die Bildantwort Dateien verschieben lassen). Statusdatei und Ordner unter Linux und macOS nur für den eigenen Benutzer, keine Symlinks. Gesamtfrist je Anfrage gegen langsam sendende Verbindungen, robuste Behandlung beliebiger Eingaben, Exportziel wird nicht still überschrieben.
 - **Bearbeitungen begrenzt:** höchstens 1000 Operationen und 100.000 Objekte, nur endliche Zahlen in sinnvollen Grenzen, Namen ohne Steuerzeichen. Vorher konnte `duplicate` den Arbeitsspeicher füllen, und NaN-Werte ergaben kaputte `.skp`-Dateien, die als erfolgreich gemeldet wurden. Der Writer lehnt ungültige Koordinaten jetzt zusätzlich ab.

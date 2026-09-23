@@ -28,6 +28,13 @@ from openskp._face_groups import face_uv_basis as _sketchup_face_uv_basis
 
 # Achtung: "from openskp import create" liefert die Funktion create(), nicht das Modul.
 _openskp_create_module = _importlib.import_module("openskp.create")
+# Ersetzt wird nur, was es gibt: ein fehlender Name wuerde sonst still neu angelegt und nie
+# aufgerufen, die Texturen laegen dann ohne Fehlermeldung schief.
+# tests/test_openskp_vertrag.py prueft zusaetzlich, dass die Ersetzungen wirklich greifen.
+for _name in ("_face_uv_basis", "_uv_matrix_for_face", "_solve_uv_matrix"):
+    if not callable(getattr(_openskp_create_module, _name, None)):
+        raise ImportError(f"OpenSKP-Version passt nicht zu skptool: openskp.create.{_name} fehlt. "
+                          "Getestet mit 1.2.0.")
 
 
 def _uv_basis_like_sketchup(points, normal):
@@ -159,9 +166,11 @@ def build_scene(skp: SkpFile):
 
 # ---------------------------------------------------------------- info
 
-def info(path: str | Path, with_bounds: bool = False) -> dict:
+def info(path: str | Path, with_bounds: bool = False, skp: SkpFile | None = None) -> dict:
+    """Kennzahlen einer .skp. skp: schon geoeffnete Datei (spart ein zweites Einlesen)."""
     version = header_version(path)
-    skp = open_skp(path)
+    if skp is None:
+        skp = open_skp(path)
     m = model_of(skp)
     inst_count: collections.Counter = collections.Counter()
     for d in [m.root, *m.definitions.values()]:

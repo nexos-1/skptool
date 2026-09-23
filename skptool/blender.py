@@ -18,11 +18,18 @@ class BlenderError(RuntimeError):
     pass
 
 
+# Linux/macOS: nur mit Administratorrechten beschreibbare Installationsorte
+_PROTECTED_POSIX = ("/usr/bin", "/usr/local/bin", "/opt", "/snap/bin", "/Applications")
+
+
 def _version_key(path: str):
     """Programmordner vor Benutzerordnern (dort koennte jeder Prozess eine Kopie ablegen),
     innerhalb davon die hoechste Version."""
-    protected = any(path.lower().startswith(os.path.normcase(b).lower())
-                    for b in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")) if b)
+    bases = [os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")]
+    if os.name != "nt":  # unter Windows koennte jeder Benutzer C:\opt oder C:\usr anlegen
+        bases += _PROTECTED_POSIX
+    p = os.path.normcase(path)
+    protected = any(p.startswith(os.path.normcase(b).rstrip("\\/") + os.sep) for b in bases if b)
     nums = re.findall(r"(\d+)\.(\d+)", path)
     return (protected, tuple(int(n) for n in nums[-1]) if nums else (0, 0))
 
@@ -61,8 +68,9 @@ def find_blender(explicit: str | None = None) -> str:
         if base and os.path.isabs(base):
             cands += glob.glob(os.path.join(base, "Blender Foundation", "Blender*", "blender.exe"))
             cands += glob.glob(os.path.join(base, "Steam", "steamapps", "common", "Blender", "blender.exe"))
-    cands += glob.glob("/Applications/Blender*.app/Contents/MacOS/Blender")
-    cands += glob.glob("/usr/bin/blender") + glob.glob("/snap/bin/blender")
+    if os.name != "nt":  # unter Windows waere /usr/bin der Ordner C:\usr\bin, den jeder anlegen kann
+        cands += glob.glob("/Applications/Blender*.app/Contents/MacOS/Blender")
+        cands += glob.glob("/usr/bin/blender") + glob.glob("/snap/bin/blender")
     if cands:
         return sorted(cands, key=_version_key)[-1]
     found = _on_path("blender")

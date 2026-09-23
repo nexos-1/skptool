@@ -1,0 +1,18 @@
+name: Wunsch oder Idee
+description: Ein Format, ein Befehl oder eine Verbesserung.
+labels: [wunsch]
+body:
+  - type: markdown
+    attributes:
+      value: "**Bitte keine vertraulichen Modelle anhängen.** Issues sind öffentlich."
+  - type: textarea
+    id: wunsch
+    attributes:
+      label: Was soll skptool können?
+    validations:
+      required: true
+  - type: textarea
+    id: zweck
+    attributes:
+      label: Wofür brauchst du es?
+      description: Zum Beispiel, welches Programm die Datei danach öffnen soll.

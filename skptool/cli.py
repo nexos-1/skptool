@@ -249,6 +249,8 @@ def convert_one(src: Path, dst: Path, a) -> str:
                     f"{st['components']} Komponenten mit {st['instances']} Platzierungen, {st['faces']} Flaechen, "
                     f"{st['textured_materials']} Texturmaterialien, {st['triangulated']} trianguliert, "
                     f"{st['skipped']} uebersprungen{check}")
+        if d_ext not in core.BLENDER_OUT_FORMATS | {".glb", ".obj", ".stl", ".ply"}:  # wie bridge.write_any
+            raise SystemExit(f"Zielformat {d_ext} wird nicht unterstuetzt")
         step(f"Blender konvertiert {src.name} nach {dst.name}")
         res = run_bridge(["load", "--in", str(src.resolve()), "--out", str(dst.resolve()),
                           "--width", str(a.width), "--height", str(a.height)] + extra,
@@ -442,7 +444,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--width", type=int, default=1600, help="Breite fuer PNG-Vorschau")
     common.add_argument("--height", type=int, default=1000, help="Hoehe fuer PNG-Vorschau")
     common.add_argument("-q", "--quiet", action="store_true", help="Keine Fortschrittsanzeige")
-    common.add_argument("--ops", help="Bearbeitungsoperationen als JSON-Text oder .json-Datei (siehe edit)")
+    common.add_argument("--ops", help="Bearbeitungsoperationen als JSON-Text, .json-Datei oder - fuer stdin "
+                                      "(siehe edit)")
     common.add_argument("-v", "--verbose", action="store_true",
                         help="Blender-Ausgabe und Zeiten je Schritt anzeigen")
     common.add_argument("--verify", action="store_true",
@@ -515,6 +518,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     from skptool import live
     live.add_live_parser(sub)
+    from skptool import bericht, vergleich
+    bericht.add_report_parser(sub)
+    vergleich.add_diff_parser(sub)
     return ap
 
 

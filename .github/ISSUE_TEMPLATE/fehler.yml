@@ -1,0 +1,42 @@
+name: Fehler melden
+description: Etwas funktioniert nicht wie beschrieben.
+labels: [fehler]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Bitte keine vertraulichen Modelle anhängen.** Issues sind öffentlich. Wenn möglich, den Fehler mit einer eigenen, kleinen Testdatei zeigen.
+        Sicherheitslücken bitte nicht hier, sondern vertraulich melden (siehe SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: skptool-Version
+      description: Ausgabe von `skptool --version`
+    validations:
+      required: true
+  - type: input
+    id: umgebung
+    attributes:
+      label: Betriebssystem und Blender-Version
+      placeholder: Windows 11, Blender 5.2 LTS
+    validations:
+      required: true
+  - type: textarea
+    id: befehl
+    attributes:
+      label: Genauer Befehl
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: ergebnis
+    attributes:
+      label: Was ist passiert, was hättest du erwartet?
+      description: Fehlermeldung vollständig einfügen, bei Bedarf mit `-v`.
+    validations:
+      required: true
+  - type: input
+    id: sketchup
+    attributes:
+      label: SketchUp-Version der Datei
+      description: Steht in der Ausgabe von `skptool info datei.skp`

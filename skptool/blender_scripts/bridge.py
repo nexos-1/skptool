@@ -130,8 +130,6 @@ def write_any(path, render_size=(1600, 1000)):
         bpy.ops.wm.alembic_export(filepath=path)
     elif ext in (".glb", ".gltf"):
         bpy.ops.export_scene.gltf(filepath=path, export_format="GLB" if ext == ".glb" else "GLTF_SEPARATE")
-    elif ext == ".dae" and hasattr(bpy.ops.wm, "collada_export"):
-        bpy.ops.wm.collada_export(filepath=path)
     elif ext == ".png":
         render_preview(path, *render_size)
     else:

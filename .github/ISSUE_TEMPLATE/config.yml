@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Sicherheitslücke vertraulich melden
+    url: https://github.com/nexos-1/skptool/security/advisories/new
+    about: Bitte nicht als öffentliches Issue, sondern hier vertraulich.

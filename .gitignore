@@ -13,3 +13,6 @@ ergebnisse/
 
 # Testdateien mit Inhalten Dritter, per tools/beispiele_laden.py
 samples/extern/
+
+# lokale Claude-Arbeitsordner (Worktrees der Agenten)
+.claude/

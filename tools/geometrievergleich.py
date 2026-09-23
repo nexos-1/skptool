@@ -3,44 +3,14 @@ r"""Platzierte Geometrie zweier .skp-Dateien vergleichen (Weltkoordinaten, wie S
 Aufruf: .venv\Scripts\python tools\geometrievergleich.py a.skp b.skp [toleranz_mm]
 
 Vergleicht die Menge aller platzierten Eckpunkte (auf die Toleranz gerastert) und die Anzahl
-Dreiecke. Unabhaengig davon, ob die Datei flach oder verschachtelt aufgebaut ist."""
-import gc
+Dreiecke. Unabhaengig davon, ob die Datei flach oder verschachtelt aufgebaut ist.
+Die Rechnung steckt in skptool/vergleich.py (auch fuer skptool diff --geometrie)."""
 import sys
+from pathlib import Path
 
-import numpy as np
-
-from skptool import core
-
-
-def points(path, tol_mm):
-    sc = core.build_scene(core.open_skp(path))
-    pts, tris = [], 0
-    for prim in sc.glb_primitives:
-        p = np.frombuffer(prim.positions, np.float32).reshape(-1, 3).astype(np.float64)
-        pts.append(np.rint(p * 1000.0 / tol_mm).astype(np.int64))
-        tris += len(prim.indices) // 3
-    del sc
-    gc.collect()
-    allp = np.unique(np.concatenate(pts), axis=0) if pts else np.empty((0, 3), np.int64)
-    return allp, tris
-
-
-def compare(a, b, tol_mm=1.0):
-    pa, ta = points(a, tol_mm)
-    pb, tb = points(b, tol_mm)
-    va = {tuple(r) for r in pa.tolist()}
-    vb = {tuple(r) for r in pb.tolist()}
-
-    def near(src, dst):  # Rasterkanten: auch Nachbarzellen zaehlen
-        hit = 0
-        for x, y, z in src:
-            if (x, y, z) in dst or any((x + i, y + j, z + k) in dst
-                                        for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)):
-                hit += 1
-        return hit
-
-    return {"punkte_a": len(va), "punkte_b": len(vb), "dreiecke_a": ta, "dreiecke_b": tb,
-            "a_in_b": near(va, vb) / max(1, len(va)), "b_in_a": near(vb, va) / max(1, len(vb))}
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from skptool.vergleich import geometrie_punkte as points  # noqa: E402,F401
+from skptool.vergleich import geometrie_vergleich as compare  # noqa: E402
 
 
 if __name__ == "__main__":
