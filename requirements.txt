@@ -1,0 +1,7 @@
+# Alle Versionen sind am 2026-09-22 mindestens 14 Tage alt (Supply-Chain-Regel).
+openskp==1.2.0        # 2026-09-04, MIT, Clean-Room-Parser/Writer fuer .skp
+pillow==12.3.0        # 2026-07-01, fuer eingebettete Texturen
+numpy==2.5.3          # 2026-09-06
+trimesh==5.1.0        # 2026-08-31
+shapely==2.1.2        # 2025-09-24
+defusedxml==0.7.1     # 2021-03-08

@@ -1,0 +1,6 @@
+* text=auto
+*.skp binary
+*.png binary
+*.blend binary
+*.glb binary
+*.cmd text eol=crlf

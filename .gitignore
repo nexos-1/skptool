@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+test_out/
+*.blend1
+ergebnisse/
+# eigene Modelle im Projektordner nie versionieren (Beispiele liegen in samples/)
+/*.skp
+/*.blend
+/*.glb
+/*.fbx
+*.skp.skptool-tmp
+
+# Testdateien mit Inhalten Dritter, per tools/beispiele_laden.py
+samples/extern/
