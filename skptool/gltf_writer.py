@@ -79,12 +79,13 @@ def split_sheared(matrix16, tol: float = 1e-6):
     return outer.T.reshape(-1).tolist(), inner.T.reshape(-1).tolist()
 
 
-def _hard_edges(defn) -> list:
+def _edges(defn, soft=False) -> list:
     """sichtbare (nicht weiche, nicht verborgene) Kanten einer Definition, lokal in
-    Metern, bitgleich zu den GLB-Positionen (float32(Zoll * 0.0254)), Blender-Achsen (Z oben)."""
+    Metern, bitgleich zu den GLB-Positionen (float32(Zoll * 0.0254)), Blender-Achsen (Z oben).
+    soft=True: stattdessen die weichen oder verborgenen Kanten."""
     out = []
     for e in defn.edges.values():
-        if e.soft or e.hidden:
+        if bool(e.soft or e.hidden) != soft:
             continue
         a, b = defn.vertices.get(e.v1_id), defn.vertices.get(e.v2_id)
         if a is None or b is None:
@@ -192,6 +193,7 @@ def write_instanced_glb(model, isc, instance_info: dict, glb_path: Path, texture
 
     meshes, mesh_index = [], {}
     hard_edges = {}  # mesh-Schluessel -> float32-Liste (x1,y1,z1,x2,y2,z2)* in Blender-Metern
+    soft_edges = {}  # ebenso fuer weiche und verborgene Kanten
     for res in isc.mesh_resources:
         prims = []
         for prim in res.primitives:
@@ -216,7 +218,8 @@ def write_instanced_glb(model, isc, instance_info: dict, glb_path: Path, texture
                            "extras": {"skp_key": res.id}})
             defn = model.root if res.definition_id == "ROOT" else model.definitions.get(res.definition_id)
             if defn is not None:
-                hard_edges[res.id] = _hard_edges(defn)
+                hard_edges[res.id] = _edges(defn)
+                soft_edges[res.id] = _edges(defn, soft=True)
 
     nodes: list[dict] = []
     stats = {"nodes": 0, "with_mesh": 0, "layers_fixed": 0, "sheared_split": 0}
@@ -284,6 +287,7 @@ def write_instanced_glb(model, isc, instance_info: dict, glb_path: Path, texture
     body = struct.pack("<II", len(js), 0x4E4F534A) + js + struct.pack("<II", len(blob), 0x004E4942) + blob
     Path(glb_path).write_bytes(struct.pack("<III", 0x46546C67, 2, 12 + len(body)) + body)
     stats["hard_edges"] = hard_edges
+    stats["soft_edges"] = soft_edges
     stats.update(meshes=len(meshes), materials=len(materials), images=len(images), textures_dropped=len(dropped),
                  triangles=sum(int(buf.accessors[p["indices"]]["count"]) // 3
                                for m in meshes for p in m["primitives"]))

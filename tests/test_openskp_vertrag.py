@@ -190,8 +190,13 @@ class TestNamenUndSignaturen(unittest.TestCase):
     def test_edit_interna(self):
         self.assertEqual(_params(edit._definition_order), ["model"])
         self.assertEqual(_params(edit._definition_has_content), ["defn", "def_builders"])
-        self.assertEqual(_params(edit._replay_body), ["target", "defn", "model", "material_slots", "layer_slots",
-                                                     "warnings", "context", "def_builders"])
+        # core._replay_body ersetzt edit._replay_body und ruft dessen Bausteine auf
+        self.assertEqual(_params(edit._edge_map), ["defn"])
+        self.assertEqual(_params(edit._replay_face), ["target", "face", "defn", "edges", "model", "material_slots",
+                                                     "warnings", "context"])
+        self.assertEqual(_params(edit._replay_instance), ["target", "inst", "def_builders", "material_slots",
+                                                         "layer_slots", "model", "warnings", "context"])
+        self.assertIn("add_face", edit._replay_face.__code__.co_names)  # core._SoftDiagonals faengt das ab
 
     def test_write_edge_chain_signatur(self):
         self.assertEqual(_params(CREATE._ArchiveWriter._write_edge_chain)[:6],
@@ -366,6 +371,21 @@ class TestErsetzungenGreifen(Base):
         m_path = self.tmp / "k.skp"
         core.save_atomic(b, m_path)
         self.assertEqual(len(SkpFile.open(str(m_path)).parse().definitions), 1)
+
+    def test_lose_kanten_im_modell_ueber_geometry_writer(self):
+        """core._predeclare_edges schreibt ins Modell selbst ueber _geometry_writer und zaehlt
+        _face_count hoch, sonst lehnt to_bytes ein Modell nur aus losen Kanten ab."""
+        b = SkpBuilder()
+        b._ensure_geometry_writer()
+        self.assertEqual(b._face_count, 0)
+        _, _, new = b._geometry_writer._write_edge_chain([(0, 0, 0), (1, 0, 0)], b._vertex_slots,
+                                                         b._edge_registry, False, False, True, True)
+        b._new_entity_count += new
+        b._face_count += 1
+        m_path = self.tmp / "lose.skp"
+        core.save_atomic(b, m_path)
+        edges = list(SkpFile.open(str(m_path)).parse().root.edges.values())
+        self.assertEqual([(e.soft, e.smooth, e.hidden) for e in edges], [(True, True, False)])
 
 
 # ---------------------------------------------------------------- c) Fehlermeldungen

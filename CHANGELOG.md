@@ -11,6 +11,11 @@ Format nach [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), Versionen 
 - **Bearbeiten per Befehl.** `skptool list` zeigt Objekte mit Ebene, Größe und Materialien, `skptool edit` wendet eine JSON-Liste fester Operationen an: `move`, `rotate`, `scale`, `set_material`, `recolor`, `set_layer`, `hide_layer`, `show_layer`, `delete`, `rename`, `duplicate`, `add_box`, `list`, `summary`. Schlägt eine Operation fehl, wird nichts geschrieben.
 - `--allow-external` für Eingaben, deren Verweise auf lokale Dateien übernommen werden sollen (siehe Sicherheit).
 - `--force` für den Stapelbetrieb.
+- **MCP-Server** `skptool mcp` für KI-Assistenten: 10 Werkzeuge über stdio, ohne neue Abhängigkeit, jeder Aufruf in eigenem Prozess mit Zeitlimit, kein Überschreiben, `--nur-lesen` und `--ordner`.
+- **3MF-Export** (`-o datei.3mf`) für 3D-Druck-Slicer, ohne Blender und ohne neue Abhängigkeit: Instanzen bleiben erhalten, Millimeter, deterministische Ausgabe, Hinweise auf offene Netze.
+- **Neue Operationen** `align`, `distribute`, `array`, `mirror`, `hide`, `show` und `measure`, Screenshot nur einer Auswahl im Live-Modus (`--select`).
+- CI-Job mit Blender 5.2.0 auf Linux (per SHA-256 geprüft).
+- **Paralleler Stapelbetrieb** `convert --jobs N` oder `--jobs auto`: jede Datei in eigenem Prozess, mit Speicherwächter. Nach `.blend` etwa 2- bis 4-mal, bei größeren Dateien nach `.glb` 4- bis 6-mal schneller.
 - `SECURITY.md`, `LICENSE` (MIT), `THIRD_PARTY.md`, `tests/test_sicherheit.py`.
 - **`skptool diff`** vergleicht zwei `.skp`-Dateien: Ebenen, Materialien, Komponenten, Gruppen und jede Platzierung, auf Wunsch auch Geometrie und Texturlage. Rückgabewert 0 gleich, 1 verschieden, 2 Fehler.
 - **`skptool report`** fasst viele Dateien zusammen, als Text, JSON, CSV (mit Schutz gegen Formeln) oder eigenständiges HTML, mit Warnungen, was beim Umwandeln verloren geht.
@@ -27,6 +32,9 @@ Format nach [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), Versionen 
 - Live-Protokoll Version 2: gegenseitige Anmeldung per HMAC statt Token im Klartext.
 - Zwei Beispieldateien mit Inhalten Dritter werden nicht mehr mitgeliefert, sondern bei Bedarf mit `tools/beispiele_laden.py` geladen. Betroffene Tests werden ohne sie übersprungen.
 - Vorschaubilder zeigen jetzt das mitgelieferte Stuhl-Beispiel.
+- **Umschreiben ins 2017-Format:** Kanten behalten ihre Einstellung hart, weich, glatt und verborgen jetzt je Kante. Vorher galt sie je Fläche, in einer Komponente wurden so aus 966 sichtbaren Kanten 19. Lose Kanten und Gruppen nur aus Linien gehen nicht mehr verloren.
+- **Blender-Rundreise behält alle Punkte:** Blender fasste Dreiecke über weiche SketchUp-Kanten hinweg zusammen und löschte dabei innere Punkte, und die Triangulierung von OpenSKP zerlegte konkave Flächen falsch. Jetzt werden nur Dreiecke derselben SketchUp-Fläche zusammengefasst, und schwierige Flächen trianguliert skptool selbst. Bei einem Testmodell gingen vorher 898 von 30.334 Punkten verloren, jetzt keiner.
+- **Ausgeblendete Ebenen:** Objekte darauf wurden bisher zusätzlich selbst verborgen geschrieben und blieben in SketchUp auch nach dem Einblenden der Ebene unsichtbar. Jetzt werden ausgeblendete Collections als ausgeblendete Tags geschrieben.
 - Nicht unterstützte Zielformate werden abgelehnt, bevor Blender startet. `.dae` als Ausgabe entfällt (Blender 5 enthält kein Collada mehr, der Weg war erreichbar, aber kaputt).
 - Unter Linux und macOS gelten `/usr/bin`, `/usr/local/bin`, `/opt`, `/snap/bin` und `/Applications` als geschützte Blender-Installationsorte.
 - `tools/geometrievergleich.py` und `tools/texturvergleich.py` brauchen keinen `PYTHONPATH` mehr.
@@ -45,6 +53,14 @@ Ergebnis eines Audits vor der Veröffentlichung. Zu jedem Punkt gibt es einen Te
 - **Dateien:** Der Schutz der Eingabe greift auch bei anderen Schreibweisen desselben Pfads. Der Stapelbetrieb überschreibt keine vorhandenen Dateien und keine eigenen Eingaben mehr. "OK" gibt es nur, wenn die Ausgabe wirklich existiert.
 - **Vorschaubilder** enthalten keine Metadaten mehr (vorher unter anderem den Pfad der `.blend`-Datei).
 - Texturen werden vor dem Dekodieren auf ihre Größe geprüft, `.usdz`-Container wie `.skp` begrenzt.
+
+### Noch offen (geplant für die nächsten Versionen)
+
+- **OpenSKP 1.3.0:** Upgrade angefangen, noch nicht geprüft und nicht enthalten. Bringt die neue Abhängigkeit `mapbox-earcut` mit und liest vermutlich auch sehr alte Dateien (SketchUp 7 und älter). Vor der Übernahme: Quellcode-Prüfung, volle Testsuite, Vergleich alt gegen neu mit `skptool diff`.
+- **Materialien gleicher Farbe** werden beim Import nach Blender noch verwechselt (das erste Material mit derselben Farbe gewinnt).
+- **Getönte Texturen** (SketchUp "Einfärben") verlieren beim Umschreiben ihre Tönung.
+- **Noch nicht in echten Programmen geprüft:** 3MF in einem Slicer, der MCP-Server in Claude Code und Claude Desktop, die CSV aus `report` in Excel, der parallele Stapelbetrieb unter Linux und macOS mit echten Dateien.
+- Zwei Live-Tests sind unter starker Last auf dem Rechner unzuverlässig (Latenzgrenze, Zählung fremder Blender-Prozesse).
 
 ## [0.1.0] - 2026-09-23
 

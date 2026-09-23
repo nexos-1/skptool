@@ -162,6 +162,14 @@ class TestClientWithoutBlender(unittest.TestCase):
         with self.assertRaises(SystemExit):
             _cli("--ops", "{kein json")
 
+    def test_select_for_screenshot_is_parsed_strictly(self):
+        self.assertEqual(live._parse_select("Stuhl*"), {"name": "Stuhl*"})
+        self.assertEqual(live._parse_select('{"layer": "Moebel"}'), {"layer": "Moebel"})
+        self.assertIsNone(live._parse_select(None))
+        for bad in ("", "   ", '{"name": NaN}', "{kaputt", "x" * 5000):
+            with self.assertRaises(SystemExit):
+                live._parse_select(bad)
+
     def test_no_em_dash_in_live_files(self):
         for p in (ROOT / "skptool" / "live.py", ROOT / "skptool" / "blender_scripts" / "live_server.py",
                   Path(__file__)):
@@ -288,6 +296,13 @@ class TestLiveBlender(unittest.TestCase):
         resp = live.run_ops([{"op": "exec", "code": "print(1)"}], self.state)
         self.assertIn("Unbekannte Operation", resp["results"][0]["error"])
 
+    def test_04b_measure_makes_no_undo_step(self):
+        resp = live.run_ops([{"op": "measure", "select": {"name": "Kiste"}, "to_object": {"name": "Wuerfel"}}],
+                            self.state)
+        self.assertTrue(resp["ok"], resp)
+        self.assertIsNone(resp["undo_step"])  # nur gelesen, also kein Rueckgaengig-Schritt
+        self.assertAlmostEqual(resp["results"][0]["distance"], 3.0, places=5)
+
     def test_05_security(self):
         before = self.center("Wuerfel")
         move = {"cmd": "ops", "ops": [{"op": "move", "select": {"name": "Wuerfel"}, "by": [5, 0, 0]}]}
@@ -361,6 +376,52 @@ class TestLiveBlender(unittest.TestCase):
             self.assertEqual(Path(p).read_bytes()[:4], b"\x89PNG")
         print(f"\n  Bild model 800x500: {resp['ms']:.0f} ms in Blender, {total:.0f} ms gesamt; "
               f"viewport {vp['ms']:.0f} ms, window {win['ms']:.0f} ms", file=sys.stderr)
+
+    def test_06b_screenshot_frames_selection(self):
+        from PIL import Image
+
+        def filled(path):
+            """Anteil der Bildpunkte, die nicht Hintergrund sind (Hintergrund = Ecke oben links)."""
+            im = Image.open(path).convert("RGB")
+            px, (w, h) = im.load(), im.size
+            bg = px[0, 0]
+            hits = sum(1 for x in range(0, w, 2) for y in range(0, h, 2)
+                       if sum(abs(a - b) for a, b in zip(px[x, y], bg)) > 40)
+            return hits / ((w + 1) // 2 * ((h + 1) // 2))
+
+        st0 = live.status(self.state)
+        whole = live.screenshot(self.tmp / "alles.png", width=400, height=250, state=self.state)
+        box = live.screenshot(self.tmp / "kiste.png", width=400, height=250, state=self.state,
+                              select={"name": "Kiste"})
+        self.assertEqual(box["framed"], 1)
+        self.assertNotIn("framed", whole)
+        a, b = filled(whole["path"]), filled(box["path"])
+        # beide Wuerfel im Gesamtbild sind klein, die Kiste allein fuellt das Bild
+        self.assertGreater(b, 2 * a, (a, b))
+        for kw, msg in (({"select": {"name": "GibtEsNicht"}}, "Keine Objekte passen"),
+                        ({"select": "Kiste"}, "select muss ein Objekt sein"),
+                        ({"select": {"name": "Kiste"}, "view": "viewport"}, "nur mit view model")):
+            with self.assertRaises(live.LiveError) as cm:
+                live.screenshot(self.tmp / "nie.png", width=200, height=100, state=self.state, **kw)
+            self.assertIn(msg, str(cm.exception))
+        self.assertFalse((self.tmp / "nie.png").exists())
+        st1 = live.status(self.state)
+        self.assertEqual(st1["all_objects"], st0["all_objects"])  # keine Kamera zurueckgeblieben
+        self.assertEqual(st1["camera"], st0["camera"])
+        old = os.environ.get(live.STATE_ENV)
+        os.environ[live.STATE_ENV] = str(self.state)
+        try:
+            rc, out = _cli("--screenshot", str(self.tmp / "cli_kiste.png"), "--select", "Kis*",
+                           "--width", "320", "--height", "200")
+            self.assertEqual(rc, 0, out)
+            self.assertTrue((self.tmp / "cli_kiste.png").exists())
+            with self.assertRaises(SystemExit):
+                _cli("--status", "--select", "Kiste")  # --select nur zusammen mit --screenshot
+        finally:
+            if old is None:
+                os.environ.pop(live.STATE_ENV, None)
+            else:
+                os.environ[live.STATE_ENV] = old
 
     def test_07_cli_commands(self):
         old = os.environ.get(live.STATE_ENV)

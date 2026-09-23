@@ -556,7 +556,7 @@ def cmd_ops(live, req):
     with bpy.context.temp_override(**_override()):
         switched = _ensure_object_mode()
         results = skp_ops.run(operations, stop_on_error=bool(req.get("stop_on_error", True)))
-        changing = [r["op"] for r in results if r.get("ok") and r["op"] not in ("list", "summary")]
+        changing = [r["op"] for r in results if r.get("ok") and r["op"] not in skp_ops.READ_ONLY]
         undo = None
         if changing:
             names = list(dict.fromkeys(changing))
@@ -601,17 +601,34 @@ def cmd_export(live, req):
     return {"started": started, "message": msg, "export": live.export_status()}
 
 
+def _frame_objects(spec):
+    """Sichtbare Mesh-Objekte der Auswahl samt Inhalt (fuer screenshot mit select)."""
+    try:
+        roots = skp_ops._top_level(skp_ops._require(skp_ops.select(spec), spec))
+    except skp_ops.OpError as exc:
+        raise UserError(str(exc)) from None
+    meshes = [o for o in skp_ops._tree_meshes(roots) if o.visible_get()]
+    if not meshes:
+        raise UserError("Die Auswahl enthaelt keine sichtbare Geometrie")
+    return meshes
+
+
 def cmd_screenshot(live, req):
     view = req.get("view", "model")
     try:
         width = min(max(int(req.get("width", 1600)), 64), 4096)
         height = min(max(int(req.get("height", 1000)), 64), 4096)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise UserError("width und height muessen Zahlen sein") from None
+    frame = None
+    if req.get("select") is not None:
+        if view != "model":
+            raise UserError("select geht nur mit view model")
+        frame = _frame_objects(req["select"])
     live.shots += 1
     path = os.path.join(live.tmp, f"bild_{live.shots:04d}.png")
     if view == "model":
-        _render_model(path, width, height)
+        _render_model(path, width, height, frame)
     elif view == "viewport":
         with bpy.context.temp_override(**_override(need_view3d=True)):
             bpy.ops.screen.screenshot_area(filepath=path)
@@ -622,7 +639,10 @@ def cmd_screenshot(live, req):
         raise UserError("view muss model, viewport oder window sein")
     if not os.path.exists(path):
         raise UserError("Bild wurde nicht geschrieben")
-    return {"path": path, "bytes": os.path.getsize(path), "view": view}
+    out = {"path": path, "bytes": os.path.getsize(path), "view": view}
+    if frame is not None:
+        out["framed"] = len(frame)
+    return out
 
 
 def cmd_quit(live, req):
@@ -650,11 +670,12 @@ def _stamp_flags(render):
             if p.identifier.startswith("use_stamp") and p.type == "BOOLEAN" and not p.is_readonly]
 
 
-def _render_model(path, width, height):
-    """Wie bridge.render_preview, aber ohne bleibende Kamera und mit wiederhergestellten Einstellungen."""
+def _render_model(path, width, height, frame=None):
+    """Wie bridge.render_preview, aber ohne bleibende Kamera und mit wiederhergestellten Einstellungen.
+    frame: nur diese Objekte ins Bild fassen (die anderen bleiben sichtbar, falls sie hineinragen)."""
     with bpy.context.temp_override(**_override()):
         scene = bpy.context.scene
-        meshes = [o for o in scene.objects if o.type == "MESH" and o.visible_get()]
+        meshes = frame or [o for o in scene.objects if o.type == "MESH" and o.visible_get()]
         if not meshes:
             raise UserError("Keine sichtbare Geometrie zum Rendern")
         mn, mx = skp_ops._world_bbox(meshes)
