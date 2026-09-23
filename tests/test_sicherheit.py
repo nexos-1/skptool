@@ -283,8 +283,17 @@ class TestWithBlender(Tmp):
                         str(self.tmp / "modell"), str(self.tmp / "privat")], check=True, capture_output=True,
                        timeout=300)
 
+    def _need_unc_in_fixture(self, name):
+        """Blender ausserhalb von Windows speichert einen Netzwerkpfad mit Backslashes als "//host/x",
+        also als Pfad relativ zur Datei: dann steckt in der erzeugten Testdatei gar kein Netzwerkpfad
+        (und sie ist dort zu Recht harmlos). Handgebaute Dateien mit echten Backslashes prueft
+        TestReferenceCheck.test_fbx_and_uncompressed_blend_network_strings auf jedem System."""
+        if os.name != "nt":
+            self.skipTest("Blender speichert Backslash-Pfade hier als relative Pfade (//...)")
+
     def test_blend_with_network_image_is_refused_before_opening(self):
         self._make()
+        self._need_unc_in_fixture("netzbild.blend")
         code, _, err = run_cli("convert", str(self.tmp / "modell" / "netzbild.blend"),
                                "-o", str(self.tmp / "x.skp"), "-q", "--allow-external")
         self.assertNotEqual(code, 0)
@@ -303,6 +312,7 @@ class TestWithBlender(Tmp):
 
     def test_open_checks_a_blend_before_the_window_loads_it(self):
         self._make()
+        self._need_unc_in_fixture("netzbild.blend")
         clean = self.tmp / "sauber.blend"
         self.assertEqual(run_cli("convert", str(S2017), "-o", str(clean), "-q")[0], 0)
         with mock.patch.object(cli, "launch_gui") as gui:

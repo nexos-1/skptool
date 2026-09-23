@@ -393,7 +393,8 @@ class TestBlender(Base):
 
     def test_blender_timeout_stops_the_job(self):
         from skptool import blender as bl
-        with mock.patch.object(bl, "BLENDER_TIMEOUT", 1):
+        # 0,05 s: so kurz, dass selbst ein schnell startendes Blender (Linux) sicher nicht fertig wird
+        with mock.patch.object(bl, "BLENDER_TIMEOUT", 0.05):
             with self.assertRaises(BlenderError) as ctx:
                 bl.run_bridge(["load", "--in", str(S2017), "--out", str(self.tmp / "x.fbx")])
         self.assertIn("nicht geantwortet", str(ctx.exception))
