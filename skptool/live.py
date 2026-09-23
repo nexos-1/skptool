@@ -240,10 +240,13 @@ def wait_for_export(state=None, timeout: float = 3600.0, poll: float = 0.5) -> d
 
 
 def screenshot(out: str | os.PathLike, view: str = "model", width: int = 1600, height: int = 1000,
-               state=None, timeout: float = 300.0) -> dict:
+               state=None, timeout: float = 300.0, select: dict | None = None) -> dict:
     """PNG des Modells (view=model: eigene Kamera, Workbench), der 3D-Ansicht (viewport) oder des
-    ganzen Fensters (window). Der Server schreibt in seinen Temp-Ordner, hier wird verschoben."""
-    resp = request("screenshot", state, timeout, view=view, width=width, height=height)
+    ganzen Fensters (window). Der Server schreibt in seinen Temp-Ordner, hier wird verschoben.
+    select (nur bei view=model): Auswahl wie bei den Operationen, das Bild zeigt nur diese Objekte
+    formatfuellend, z. B. {"name": "Stuhl*"}."""
+    extra = {} if select is None else {"select": select}
+    resp = request("screenshot", state, timeout, view=view, width=width, height=height, **extra)
     src = _server_image(resp.get("path"))
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -394,7 +397,7 @@ def _print_results(results) -> None:
     for r in results or []:
         if not r.get("ok"):
             print(f"  FEHLER {r.get('op')}: {r.get('error')}")
-        elif r["op"] in ("list", "summary"):
+        elif r["op"] in ("list", "summary", "measure"):
             detail = {k: v for k, v in r.items() if k not in ("op", "ok")}
             print(f"  {r['op']}:\n" + json.dumps(detail, indent=2, ensure_ascii=False))
         else:
@@ -418,6 +421,9 @@ def add_live_parser(sub) -> None:
     p.add_argument("--view", choices=["model", "viewport", "window"], default="model",
                    help="model: ganzes Modell (Standard), viewport: 3D-Ansicht wie gerade zu sehen, "
                         "window: ganzes Fenster")
+    p.add_argument("--select", metavar="AUSWAHL",
+                   help='Mit --screenshot (view model): nur diese Objekte ins Bild fassen, Namensmuster '
+                        'wie "Stuhl*" oder JSON wie {"layer": "Moebel"}')
     p.add_argument("--width", type=int, default=1600)
     p.add_argument("--height", type=int, default=1000)
     p.add_argument("--status", action="store_true", help="Zustand anzeigen (Datei, Aenderungen, Export)")
@@ -428,8 +434,35 @@ def add_live_parser(sub) -> None:
     p.set_defaults(func=cmd_live)
 
 
+def _parse_select(raw):
+    """--select: JSON-Objekt ({"name": ...}) oder schlicht ein Namensmuster."""
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        raise SystemExit("--select darf nicht leer sein")
+    if len(text) > 4096:
+        raise SystemExit("--select ist zu lang")
+    if not text.startswith("{"):
+        return {"name": text}
+
+    def no_constants(name):
+        raise ValueError(f"{name} ist keine gueltige Zahl")
+
+    try:
+        spec = json.loads(text, parse_constant=no_constants)
+    except (ValueError, RecursionError) as exc:
+        raise SystemExit(f"--select ist kein gueltiges JSON: {str(exc)[:200]}") from None
+    if not isinstance(spec, dict):
+        raise SystemExit('--select braucht ein Namensmuster oder ein Objekt wie {"name": "Stuhl*"}')
+    return spec
+
+
 def cmd_live(a) -> int:
     ops = _load_ops(a.ops) if a.ops else None
+    select = _parse_select(getattr(a, "select", None))
+    if select is not None and not a.screenshot:
+        raise SystemExit("--select gehoert zu --screenshot")
     if not any([ops, a.undo, a.save, a.export, a.screenshot, a.status, a.quit]):
         a.status = True
     out: dict = {}
@@ -465,7 +498,8 @@ def cmd_live(a) -> int:
                     print(resp["message"])
                 _print_export(resp.get("export"))
         if a.screenshot:
-            resp = screenshot(a.screenshot, view=a.view, width=a.width, height=a.height, timeout=a.timeout)
+            resp = screenshot(a.screenshot, view=a.view, width=a.width, height=a.height, timeout=a.timeout,
+                              select=select)
             out["screenshot"] = resp
             if not a.json:
                 print(f"Bild: {resp['path']} ({resp['ms']} ms)")

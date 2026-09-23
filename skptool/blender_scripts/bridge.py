@@ -275,12 +275,21 @@ def _keep_back_uv(me, doomed, keepers, rank, mi, slot_textured):
 BACK_ATTR = "skp_back_material"  # Materialslot der Rueckseite + 1, 0 = keine
 
 
-def _clean_mesh(me, default_mats, keep_triangles, hard=None):
+def _edge_keys(flat):
+    """Flache Kantenliste (x1,y1,z1,x2,y2,z2)* -> Menge richtungsloser Schluessel."""
+    h = np.asarray(flat or [], np.float64).reshape(-1, 2, 3).tolist()
+    return {tuple(sorted((tuple(a), tuple(b)))) for a, b in h}
+
+
+def _clean_mesh(me, default_mats, keep_triangles, hard=None, soft=None):
     """Rueckseiten-Duplikate entfernen, Doppelpunkte verschmelzen, Dreiecke zu Flaechen.
 
     hard = flache Liste harter SketchUp-Kanten (lokal, Meter) oder None. Mit hard
     werden Kanten weich/hart markiert (sharp_edge) und Flaechen glatt schattiert, und die
-    Rueckseitenbemalung bleibt im Flaechenattribut skp_back_material erhalten."""
+    Rueckseitenbemalung bleibt im Flaechenattribut skp_back_material erhalten.
+    soft = ebenso die weichen und verborgenen SketchUp-Kanten. Mit hard verschmelzen nur
+    Dreiecke derselben SketchUp-Flaeche: echte Kanten (auch weiche zwischen koplanaren Flaechen)
+    und alle Punkte bleiben, sonst fielen z. B. innere Punkte einer flachen Dreiecksflaeche weg."""
     t = time.perf_counter()
     slot_default = [bool(m and m.name in default_mats) for m in me.materials]
     slot_textured = [bool(m and m.name not in default_mats and _mat_image(m)) for m in me.materials]
@@ -315,22 +324,22 @@ def _clean_mesh(me, default_mats, keep_triangles, hard=None):
     t = _acc("remove_doubles", t)
     delimit = {"MATERIAL", "UV"}
     if hard is not None:
-        h = np.asarray(hard, np.float64).reshape(-1, 2, 3).tolist()
-        hard_keys = {tuple(sorted((tuple(a), tuple(b)))) for a, b in h}
+        hard_keys, soft_keys = _edge_keys(hard), _edge_keys(soft)
         for f in bm.faces:
             f.smooth = True
-        for e in bm.edges:
-            a, b = e.verts
-            e.smooth = tuple(sorted((tuple(a.co), tuple(b.co)))) not in hard_keys
         blay = bm.faces.layers.int.get(BACK_ATTR)
         for e in bm.edges:
+            a, b = e.verts
+            key = tuple(sorted((tuple(a.co), tuple(b.co))))
+            e.smooth = key not in hard_keys
+            # SEAM haelt weiche SketchUp-Kanten und Grenzen der Rueckseitenbemalung
             lf = e.link_faces
-            if len(lf) == 2 and lf[0][blay] != lf[1][blay]:
-                e.seam = True
+            e.seam = key in soft_keys or (len(lf) == 2 and lf[0][blay] != lf[1][blay])
         delimit = {"MATERIAL", "UV", "SHARP", "SEAM"}
     if not keep_triangles:
+        # Bei SketchUp-Geometrie keine Punkte aufloesen: jeder Punkt der GLB ist ein SketchUp-Punkt
         bmesh.ops.dissolve_limit(bm, angle_limit=math.radians(0.05), use_dissolve_boundaries=False,
-                                 verts=bm.verts, edges=bm.edges, delimit=delimit)
+                                 verts=bm.verts if hard is None else [], edges=bm.edges, delimit=delimit)
     if hard is not None:
         for e in bm.edges:
             e.seam = False
@@ -417,11 +426,13 @@ def fix_up_skp_import(meta, keep_triangles=False):
     # Je EINZIGARTIGEM Mesh (geteilte Meshes nur einmal): Duplikate entfernen, Flaechen bilden
     removed = 0
     hard_all = meta.get("hard_edges") or {}
+    soft_all = meta.get("soft_edges") or {}
     for me in bpy.data.meshes:
         if me.users == 0 or not me.polygons:
             continue
         key = me.get("skp_key")
-        removed += _clean_mesh(me, default_mats, keep_triangles, hard_all.get(key) if key else None)
+        removed += _clean_mesh(me, default_mats, keep_triangles, hard_all.get(key) if key else None,
+                               soft_all.get(key) if key else None)
     _lap("mesh cleanup (per unique mesh)")
     _flush_acc()
 
@@ -656,12 +667,55 @@ def _is_default(mat):
     return mat is None or _BLENDER_SUFFIX.sub("", mat.name) == DEFAULT_MAT
 
 
+def _own_hidden(ob):
+    """Ist das Objekt selbst verborgen (H im Viewport, Bildschirm-Symbol)? Eine ausgeblendete Ebene
+    zaehlt hier nicht: sie wird als verborgenes Tag geschrieben, sonst blieben ihre Objekte in
+    SketchUp auch nach dem Einblenden des Tags unsichtbar."""
+    return bool(skp_ops._hidden_itself(ob))
+
+
+def _hidden_layers():
+    """Namen der ausgeblendeten Collections (auch ueber eine ausgeblendete Eltern-Collection oder
+    eine in der Ansichtsebene ausgeschlossene)."""
+    out = set()
+
+    def walk(lc, hidden):
+        for ch in lc.children:
+            h = hidden or ch.exclude or ch.hide_viewport or ch.collection.hide_viewport
+            if h:
+                out.add(ch.collection.name)
+            walk(ch, h)
+
+    walk(bpy.context.view_layer.layer_collection, False)
+    return sorted(out)
+
+
+_UNTAGGED = ("", "Layer0", "Untagged", "Scene Collection")  # werden kein eigenes Tag
+
+
 def _instance_entry(ob, d, inst_mat, scene_col, flatten):
     layer = next((c.name for c in ob.users_collection if c != scene_col), "")
+    # Liegt das Objekt in einer ausgeblendeten Collection, die kein Tag wird, bleibt es eben
+    # selbst verborgen, damit es in SketchUp nicht ploetzlich erscheint
+    hidden = _own_hidden(ob) or (layer in _UNTAGGED and not ob.visible_get())
     return {"name": ob.name, "definition": d, "parent": -1,
             "matrix": None if flatten else ob,  # _link_parents setzt die Matrix
-            "layer": layer, "hidden": not ob.visible_get(), "material": inst_mat,
-            "skp_definition": str(ob.get("skp_definition") or "")}
+            "layer": layer, "hidden": hidden, "material": inst_mat,
+            "skp_definition": str(ob.get("skp_definition") or ""),
+            "_with_parent": bool(ob.get(skp_ops.HIDDEN_WITH_PARENT))}
+
+
+def _hidden_with_parent(instances):
+    """Nur die aeussere verborgene Gruppe traegt das Merkmal (wie "Ausblenden" in SketchUp).
+
+    Objekte, die die Operation hide nur zusammen mit ihrem Elternobjekt verborgen hat, werden
+    sichtbar geschrieben, solange ihr mitgeschriebenes Elternobjekt verborgen ist: in SketchUp
+    verschwinden sie mit ihm, und gleiche Gruppen behalten eine gemeinsame Definition."""
+    own = [bool(i["hidden"]) for i in instances]
+    for i, inst in enumerate(instances):
+        p = inst.get("parent", -1)
+        if inst.pop("_with_parent", False) and own[i] and 0 <= p < len(instances) and own[p]:
+            inst["hidden"] = False
 
 
 def _link_parents(instances, included):
@@ -698,8 +752,10 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
        "definitions": [{"name", "offset", "nverts", "npolys", "nloops", "nuv", "uses"}],
        "instances": [{"name", "definition": Index oder -1 (reiner Container), "parent": Index
                       in "instances" oder -1, "matrix": 16 floats zeilenweise, Meter, relativ
-                      zum Elternobjekt (ohne Eltern: Welt), "layer", "hidden",
-                      "material": Materialindex oder -1, "skp_definition": Name oder ""}]}
+                      zum Elternobjekt (ohne Eltern: Welt), "layer", "hidden" (das Objekt
+                      selbst, nicht seine Ebene), "material": Materialindex oder -1,
+                      "skp_definition": Name oder ""}],
+       "layers": [Namen], "hidden_layers": [Namen der ausgeblendeten Ebenen]}
     Binaerdatei, je Definition ab "offset" hintereinander (little endian):
       verts   float32[nverts*3]  lokale Koordinaten (bei flatten: Weltkoordinaten)
       ltotal  int32[npolys]      Eckenzahl je Flaeche
@@ -817,13 +873,15 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
             _acc("instance bookkeeping", t)
     if not flatten:
         _link_parents(instances, included)
+    _hidden_with_parent(instances)
     if flatten:
         for inst in instances:
             inst["matrix"] = [float(v) for row in Matrix.Identity(4) for v in row]
     header = {"format": DUMP_FORMAT, "version": DUMP_VERSION, "unit": "m",
               "bin": os.path.basename(bin_path), "materials": mt.mats,
               "definitions": defs, "instances": instances,
-              "layers": [c.name for c in bpy.data.collections]}
+              "layers": [c.name for c in bpy.data.collections],
+              "hidden_layers": _hidden_layers()}
     with open(header_path, "w", encoding="utf-8") as fh:
         json.dump(header, fh)
     _flush_acc()

@@ -43,9 +43,22 @@ Bitte Sicherheitslücken **nicht** als öffentliches Issue melden, sondern vertr
 - Statusdatei, Ordner und Log sind nur für den eigenen Benutzer lesbar (unter Linux und macOS 0600/0700, Symlinks werden abgelehnt).
 - Bilder landen nur im eigenen Temp-Ordner, das Exportziel steht beim Start fest und ist nie die Originaldatei.
 
+**MCP-Server (`skptool mcp`)**
+
+Ein KI-Assistent kann durch Inhalte, die er liest, manipuliert werden (Prompt-Injection). Der Server behandelt deshalb jedes Argument als nicht vertrauenswürdig:
+
+- Ausgaben überschreiben nie eine vorhandene Datei, außer mit `ueberschreiben: true`, und nie eine Eingabe. Das Ergebnis entsteht in einem eigenen Temp-Ordner und wird dann so an seinen Platz gebracht, dass eine inzwischen entstandene Datei nicht ersetzt wird.
+- Als Ausgabe nur Formate, die genau eine Datei ergeben. Eingaben nur mit Endungen, die skptool kennt.
+- Netzwerk-, Geräte- und URL-Pfade, Netzlaufwerke, alternative Datenströme (`datei.skp:strom`) und reservierte Gerätenamen werden abgelehnt, bevor darauf zugegriffen wird. Mit `--ordner` nur Dateien in freigegebenen Ordnern.
+- Externe Dateien, auf die eine Eingabe verweist, werden nie übernommen, es gibt dafür keinen Schalter.
+- Operationen werden wie bei `--ops` geprüft, danach von `ops.py` in Blender. Kein Werkzeug löscht Dateien.
+- Jeder Aufruf läuft in einem eigenen Prozess mit Zeitlimit (Standard 900 s), danach werden der Prozess und ein gestartetes Blender beendet. Höchstens 2 Aufrufe arbeiten gleichzeitig.
+- Textausgaben sind auf 200 KB begrenzt, Steuer- und Bidi-Zeichen werden maskiert, stdout enthält nur JSON-RPC.
+- Grenze: Namen und Texte aus Modellen gelangen als Daten zum Assistenten. Ob er sie als Anweisung missversteht, liegt beim Client. Schreibende Werkzeuge im Client bestätigen lassen oder den Server mit `--nur-lesen` starten.
+
 ## Bekannte Grenzen
 
 - **Blender und OpenSKP lesen die Dateien.** Fehler in deren Lesern (etwa Speicherfehler in einem Importer) liegen außerhalb von `skptool`. Für fremde Dateien gilt deshalb dasselbe wie beim Öffnen in Blender selbst.
 - Bei binären FBX- und Alembic-Dateien sucht `skptool` Netzwerkpfade im Dateiinhalt. Ein Pfad, der in komprimierten Blöcken versteckt ist, wird so nicht gefunden. `.blend` (auch komprimiert), glTF, OBJ/MTL und USD werden dagegen vollständig geprüft.
 - **cmd.exe** sucht Befehle zuerst im aktuellen Ordner. Wer `skptool` in cmd in einem fremden Ordner tippt, bekäme dort eine `skptool.cmd` oder `skptool.bat` zuerst. PowerShell durchsucht den aktuellen Ordner nicht. In cmd hilft die Umgebungsvariable `NoDefaultCurrentDirectoryInExePath=1`.
-- Unter Linux und macOS laufen die Tests ohne Blender in der CI, mit Blender ist `skptool` dort nicht getestet.
+- Unter Linux laufen alle Tests in der CI auch mit Blender 5.2.0, unter macOS ohne Blender. Die Fenster-Tests des Live-Modus laufen nur unter Windows.

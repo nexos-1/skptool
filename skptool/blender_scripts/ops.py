@@ -15,9 +15,43 @@ Auswahl ("select"), alle Angaben optional und kombinierbar (UND):
   material    Objekt benutzt dieses Material
   definition  Name der SketchUp-Komponente (alle Platzierungen)
   type        "mesh" (Standard) oder "any"
-Ohne "select" gilt die Operation fuer alle Mesh-Objekte (nur bei list und hide/show sinnvoll).
+Ohne "select" gilt die Operation fuer alle Mesh-Objekte (nur bei list, summary, measure und
+hide/show sinnvoll; hide/show nehmen dann alle Objekte der Szene).
 
 Einheiten: Meter, Grad. Achsen: x, y, z wie in SketchUp (z oben).
+
+Operationen (Felder in eckigen Klammern sind optional):
+  list          [select] [limit]              Objekte mit Ebene, Groesse, Materialien
+  summary                                     Kennzahlen des ganzen Modells
+  measure       [select] [to_object]          nur lesen: Groesse, Mitte, min/max der Auswahl;
+                                              mit to_object auch Abstand der beiden Mitten
+  move          select, by | to [anchor]      verschieben um [x, y, z] oder Mitte nach [x, y, z]
+  rotate        select, deg [axis] [pivot]    drehen (axis x/y/z, Standard z)
+  scale         select, factor [pivot]        skalieren, factor Zahl oder [x, y, z]
+  mirror        select, axis [pivot]          spiegeln an der Ebene durch pivot senkrecht zu axis
+  align         select, axis [to] [to_object] ausrichten: axis "x" oder ["x", "y"], to "min",
+                                              "center" oder "max" (Standard "min") der gemeinsamen
+                                              Box oder der Box von to_object (eine Auswahl)
+  distribute    select, axis [gap]            gleichmaessig verteilen: ohne gap die Mitten
+                                              zwischen dem ersten und letzten Objekt (mind. 3),
+                                              mit gap feste Luecke in Metern ab dem ersten
+  duplicate     select [offset] [count]       verknuepfte Kopien samt Inhalt in einer Reihe
+  array         select, counts, spacing       verknuepfte Kopien im Raster: counts [nx, ny, nz]
+                                              (je 1 bis 1000), spacing [dx, dy, dz] in Metern
+  hide / show   [select]                      Objekte samt Inhalt aus- bzw. einblenden (nicht
+                                              Ebenen), wird in der .skp als verborgen geschrieben
+  set_material  select, material [color] [alpha] [replace]
+  recolor       material, color [alpha]
+  set_layer     select, layer
+  hide_layer / show_layer  layer
+  delete        select
+  rename        select, to
+  add_box       [name] [size] [at] [layer] [material] [color] [alpha]
+Pivot ("pivot"): "self" (Standard, je Objekt seine Mitte), "group" (Mitte aller), "origin" oder
+[x, y, z]; rotate und scale kennen zusaetzlich "bottom".
+Die Box eines Objekts umfasst bei align, distribute, mirror, array und measure seinen ganzen
+Inhalt (wie eine SketchUp-Gruppe). Die neueren Operationen (measure, mirror, align, distribute,
+array, hide, show) lehnen unbekannte Felder ab.
 
 Grenzen (gegen versehentliche oder boeswillige Riesenauftraege): hoechstens MAX_OPS Operationen
 pro Aufruf, hoechstens MAX_OBJECTS Objekte in der Szene, Zahlen endlich und betragsmaessig bis
@@ -35,6 +69,10 @@ MAX_OPS = 1000
 MAX_OBJECTS = 100_000
 MAX_COORD = 1e6        # Meter bzw. Faktor
 MAX_PATTERN = 256
+READ_ONLY = frozenset({"list", "summary", "measure"})  # aendern nichts (kein Rueckgaengig-Schritt)
+# Markiert Objekte, die hide nur zusammen mit ihrem Elternobjekt verborgen hat. Beim Schreiben der
+# .skp traegt dann nur die aeussere Gruppe das Verborgen-Merkmal, wie nach "Ausblenden" in SketchUp.
+HIDDEN_WITH_PARENT = "skp_hidden_with_parent"
 
 
 def op(fn=None, *, name=None):
@@ -194,6 +232,71 @@ def _budget(extra):
     now = len(bpy.data.objects)
     if now + extra > MAX_OBJECTS:
         raise OpError(f"Das ergaebe {now + extra} Objekte, hoechstens {MAX_OBJECTS} sind erlaubt")
+
+
+def _fields(p, name, allowed):
+    """Unbekannte Felder ablehnen (Tippfehler wie "axsi" sollen nicht still ignoriert werden)."""
+    unknown = set(p) - {"op", *allowed}
+    if unknown:
+        shown = ", ".join(sorted(repr(str(k)[:40]) for k in unknown)[:10])
+        raise OpError(f"Unbekannte Felder fuer {name}: {shown}. Moeglich: {', '.join(allowed)}")
+
+
+def _need(p, key, hint):
+    if key not in p:
+        raise OpError(f"{p.get('op')} braucht {hint}")
+    return p[key]
+
+
+def _axis(v, what="axis"):
+    """Achse als Index 0, 1, 2 aus "x", "y", "z" (ohne Gross-/Kleinschreibung)."""
+    if not isinstance(v, str) or v.strip().lower() not in ("x", "y", "z"):
+        raise OpError(f"{what} muss x, y oder z sein")
+    return "xyz".index(v.strip().lower())
+
+
+def _axes(v, what="axis"):
+    """Eine Achse ("x") oder eine Liste verschiedener Achsen (["x", "y"])."""
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, list) or not 1 <= len(v) <= 3:
+        raise OpError(f'{what} muss x, y oder z sein oder eine Liste wie ["x", "y"]')
+    out = []
+    for a in v:
+        i = _axis(a, what)
+        if i in out:
+            raise OpError(f"{what} nennt eine Achse doppelt")
+        out.append(i)
+    return out
+
+
+def _tree_meshes(roots):
+    """Alle Mesh-Objekte in den Teilbaeumen (Gruppe samt Inhalt)."""
+    return [o for r in roots for o in _subtree(r) if o.type == "MESH"]
+
+
+def _tree_bbox(roots):
+    """Weltbox der Objekte samt Inhalt; ohne Geometrie die Lage der Objekte selbst."""
+    meshes = _tree_meshes(roots)
+    if meshes:
+        return _world_bbox(meshes)
+    pts = [r.matrix_world.translation for r in roots]
+    mn, mx = pts[0].copy(), pts[0].copy()
+    for q in pts[1:]:
+        mn = Vector(map(min, mn, q))
+        mx = Vector(map(max, mx, q))
+    return mn, mx
+
+
+def _within(mn, mx):
+    """Ergebnis muss im erlaubten Bereich bleiben (sonst scheitert erst das Schreiben der .skp)."""
+    if max(max(abs(v) for v in mn), max(abs(v) for v in mx)) > MAX_COORD:
+        raise OpError(f"Das Ergebnis laege weiter als {MAX_COORD:g} m vom Ursprung entfernt")
+
+
+def _selection(p, key="select"):
+    spec = p.get(key)
+    return _top_level(_require(select(spec), spec))
 
 
 def _top_level(obs):
@@ -445,21 +548,258 @@ def duplicate(p):
     made = []
     for root in obs:
         for i in range(1, count + 1):
-            mapping = {}
-            for o in _subtree(root):
-                c = o.copy()  # teilt die Geometrie, behaelt lokale Transformation
-                for col in o.users_collection:
-                    col.objects.link(c)
-                mapping[o] = c
-            for o, c in mapping.items():
-                if o is root:
-                    c.parent = o.parent
-                    c.matrix_world = Matrix.Translation(step * i) @ o.matrix_world
-                else:
-                    c.parent = mapping[o.parent]
-                    c.matrix_parent_inverse = o.matrix_parent_inverse.copy()
-            made.append(mapping[root].name)
+            made.append(_copy_tree(root, Matrix.Translation(step * i)).name)
     return {"created": len(made), "names": made[:50]}
+
+
+def _copy_tree(root, m_world):
+    """Verknuepfte Kopie von root samt Inhalt, um m_world (Weltmatrix) versetzt. Rueckgabe: neue Wurzel."""
+    mapping = {}
+    for o in _subtree(root):
+        c = o.copy()  # teilt die Geometrie, behaelt lokale Transformation
+        for col in o.users_collection:
+            col.objects.link(c)
+        mapping[o] = c
+    for o, c in mapping.items():
+        if o is root:
+            c.parent = o.parent
+            c.matrix_world = m_world @ o.matrix_world
+        else:
+            c.parent = mapping[o.parent]
+            c.matrix_parent_inverse = o.matrix_parent_inverse.copy()
+    return mapping[root]
+
+
+@op
+def array(p):
+    """Verknuepfte Kopien im Raster (1D, 2D oder 3D); das Original bleibt Zelle [0, 0, 0]."""
+    _fields(p, "array", ("select", "counts", "spacing"))
+    obs = _selection(p)
+    counts = _need(p, "counts", '"counts": [nx, ny, nz], z. B. [3, 2, 1]')
+    if not isinstance(counts, list) or len(counts) != 3:
+        raise OpError('counts braucht [nx, ny, nz], z. B. [3, 2, 1]')
+    n = [_int(c, "counts", 1, 1000) for c in counts]
+    total = n[0] * n[1] * n[2]
+    if total < 2:
+        raise OpError("counts ergibt keine Kopie, mindestens ein Wert muss groesser als 1 sein")
+    step = _vec(_need(p, "spacing", '"spacing": [dx, dy, dz] in Metern'), "spacing")
+    # Grenzen pruefen, BEVOR irgendetwas angelegt wird
+    _budget(sum(len(_subtree(r)) for r in obs) * (total - 1))
+    mn, mx = _tree_bbox(obs)
+    reach = Vector([step[k] * (n[k] - 1) for k in range(3)])
+    _within(mn + Vector([min(v, 0.0) for v in reach]), mx + Vector([max(v, 0.0) for v in reach]))
+    made = []
+    for root in obs:
+        for iz in range(n[2]):
+            for iy in range(n[1]):
+                for ix in range(n[0]):
+                    if ix == iy == iz == 0:
+                        continue
+                    off = Vector((ix * step.x, iy * step.y, iz * step.z))
+                    made.append(_copy_tree(root, Matrix.Translation(off)).name)
+    return {"created": len(made), "grid": n, "names": made[:50]}
+
+
+def _mirror_pivot(obs, pivot):
+    if isinstance(pivot, str) and pivot in ("self", "each"):
+        return None
+    if pivot == "group":
+        mn, mx = _tree_bbox(obs)
+        return (mn + mx) / 2
+    if pivot == "origin":
+        return Vector((0, 0, 0))
+    if isinstance(pivot, list) and len(pivot) == 3:
+        return _vec(pivot, "pivot")
+    raise OpError("pivot muss self, group, origin oder [x, y, z] sein")
+
+
+@op
+def mirror(p):
+    """Spiegeln an der Ebene durch pivot senkrecht zu axis (wie "Spiegeln entlang" in SketchUp).
+
+    Die Geometrie bleibt geteilt, nur die Platzierung bekommt eine Spiegelung (Determinante -1).
+    SketchUp und Blender zeigen die Vorderseiten dabei weiter nach aussen."""
+    _fields(p, "mirror", ("select", "axis", "pivot"))
+    obs = _selection(p)
+    i = _axis(_need(p, "axis", '"axis": "x", "y" oder "z"'))
+    f = [1.0, 1.0, 1.0]
+    f[i] = -1.0
+    m = Matrix.Diagonal((*f, 1.0))
+    center = _mirror_pivot(obs, p.get("pivot", "self"))
+    for o in obs:
+        c = center
+        if c is None:
+            mn, mx = _tree_bbox([o])
+            c = (mn + mx) / 2
+        _apply_world(o, _around(c, m))
+    return {"mirrored": len(obs), "axis": "xyz"[i]}
+
+
+def _edge_value(mn, mx, i, where):
+    if where == "min":
+        return mn[i]
+    if where == "max":
+        return mx[i]
+    return (mn[i] + mx[i]) / 2
+
+
+def _inside(obj, roots):
+    """Liegt obj in einem der Teilbaeume (oder ist selbst eine der Wurzeln)?"""
+    chosen = set(roots)
+    while obj is not None:
+        if obj in chosen:
+            return True
+        obj = obj.parent
+    return False
+
+
+@op
+def align(p):
+    """Ausrichten der Boxen an min, Mitte oder max der gemeinsamen Box oder eines Bezugsobjekts."""
+    _fields(p, "align", ("select", "axis", "to", "to_object"))
+    obs = _selection(p)
+    axes = _axes(_need(p, "axis", '"axis": "x", "y", "z" oder eine Liste wie ["x", "y"]'))
+    where = p.get("to", "min")
+    if not isinstance(where, str) or where not in ("min", "center", "max"):
+        raise OpError('to muss "min", "center" oder "max" sein')
+    if "to_object" in p:
+        refs = _selection(p, "to_object")
+        ref_set = set(refs)
+        movers = [o for o in obs if o not in ref_set]
+        if not movers:
+            raise OpError("Nichts auszurichten: alle ausgewaehlten Objekte sind selbst der Bezug")
+        if any(_inside(r, movers) for r in refs):
+            raise OpError("Das Bezugsobjekt liegt in einem der auszurichtenden Objekte")
+        rmn, rmx = _tree_bbox(refs)
+    else:
+        movers = obs
+        rmn, rmx = _tree_bbox(obs)
+    target = [_edge_value(rmn, rmx, i, where) for i in axes]
+    for o in movers:
+        mn, mx = _tree_bbox([o])
+        d = Vector((0.0, 0.0, 0.0))
+        for i, t in zip(axes, target):
+            d[i] = t - _edge_value(mn, mx, i, where)
+        _apply_world(o, Matrix.Translation(d))
+    return {"aligned": len(movers), "axis": "".join("xyz"[i] for i in axes), "to": where,
+            "value": [round(t, 6) for t in target]}
+
+
+@op
+def distribute(p):
+    """Gleichmaessig verteilen entlang einer Achse, nach Mitten oder mit fester Luecke."""
+    _fields(p, "distribute", ("select", "axis", "gap"))
+    obs = _selection(p)
+    i = _axis(_need(p, "axis", '"axis": "x", "y" oder "z"'))
+    boxes = {o: _tree_bbox([o]) for o in obs}
+    moves = {}
+    if "gap" in p:
+        if len(obs) < 2:
+            raise OpError(f"distribute mit gap braucht mindestens 2 Objekte, gefunden: {len(obs)}")
+        gap = _num(p["gap"], "gap")
+        order = sorted(obs, key=lambda o: (boxes[o][0][i], o.name))
+        pos = boxes[order[0]][1][i] + gap
+        for o in order[1:]:
+            mn, mx = boxes[o]
+            moves[o] = pos - mn[i]
+            pos = mx[i] + moves[o] + gap
+        result = {"gap": round(gap, 6)}
+    else:
+        if len(obs) < 3:
+            raise OpError(f"distribute nach Mitten braucht mindestens 3 Objekte, gefunden: {len(obs)} "
+                          "(oder \"gap\" angeben)")
+        mid = {o: (boxes[o][0][i] + boxes[o][1][i]) / 2 for o in obs}
+        order = sorted(obs, key=lambda o: (mid[o], o.name))
+        first, last = mid[order[0]], mid[order[-1]]
+        step = (last - first) / (len(order) - 1)
+        for k, o in enumerate(order[1:-1], 1):
+            moves[o] = first + k * step - mid[o]
+        result = {"step": round(step, 6)}
+    for o, d in moves.items():
+        mn, mx = boxes[o]
+        shift = Vector((0.0, 0.0, 0.0))
+        shift[i] = d
+        _within(mn + shift, mx + shift)
+    for o, d in moves.items():
+        shift = Vector((0.0, 0.0, 0.0))
+        shift[i] = d
+        _apply_world(o, Matrix.Translation(shift))
+    return {"distributed": len(obs), "axis": "xyz"[i], **result, "order": [o.name for o in order][:50]}
+
+
+def _hidden_itself(o):
+    try:
+        return o.hide_get() or o.hide_viewport
+    except RuntimeError:  # nicht in der aktiven Ansichtsebene
+        return o.hide_viewport
+
+
+def _set_hidden(o, hidden):
+    try:
+        o.hide_set(hidden)  # wie H / Alt+H in Blender (Auge im Outliner)
+    except RuntimeError:  # nicht in der aktiven Ansichtsebene
+        o.hide_viewport = hidden
+    if not hidden:
+        o.hide_viewport = False
+    o.hide_render = hidden
+
+
+def _visibility(p, hidden):
+    name = "hide" if hidden else "show"
+    _fields(p, name, ("select",))
+    spec = p.get("select")
+    if spec is None:
+        roots = _top_level(list(bpy.context.scene.objects))
+    else:
+        roots = _selection(p)
+    n = 0
+    for root in roots:
+        for o in _subtree(root):
+            if hidden and o is not root:
+                # schon vorher selbst verborgene Teile behalten in der .skp ihr eigenes Merkmal
+                if HIDDEN_WITH_PARENT in o or not _hidden_itself(o):
+                    o[HIDDEN_WITH_PARENT] = True
+            elif HIDDEN_WITH_PARENT in o:
+                del o[HIDDEN_WITH_PARENT]
+            _set_hidden(o, hidden)
+            n += 1
+    return {"hidden" if hidden else "shown": n, "names": [r.name for r in roots][:50]}
+
+
+@op
+def hide(p):
+    """Objekte samt Inhalt ausblenden (einzelne Objekte, nicht Ebenen)."""
+    return _visibility(p, True)
+
+
+@op
+def show(p):
+    """Objekte samt Inhalt wieder einblenden."""
+    return _visibility(p, False)
+
+
+def _rounded(v):
+    return [round(x, 6) for x in v]
+
+
+def _box(roots):
+    """(Mitte, Beschreibung) der Box samt Inhalt, gerundet auf Mikrometer."""
+    mn, mx = _tree_bbox(roots)
+    c = (mn + mx) / 2
+    return c, {"count": len(roots), "size": _rounded(mx - mn), "center": _rounded(c),
+               "min": _rounded(mn), "max": _rounded(mx)}
+
+
+@op
+def measure(p):
+    """Nur lesen: Box der Auswahl samt Inhalt; mit to_object auch Abstand der Mitten."""
+    _fields(p, "measure", ("select", "to_object"))
+    c1, out = _box(_selection(p))
+    if "to_object" in p:
+        c2, other = _box(_selection(p, "to_object"))
+        delta = c2 - c1
+        out.update(other=other, delta=_rounded(delta), distance=round(delta.length, 6))
+    return out
 
 
 @op

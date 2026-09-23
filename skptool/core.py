@@ -76,8 +76,81 @@ def _uv_matrix_for_face(points, pairs, normal):
 
 _openskp_create_module._uv_matrix_for_face = _uv_matrix_for_face
 
+# Flaechen in Dreiecke zerlegen (Szene, GLB fuer Blender, diff): OpenSKP 1.2.0 trianguliert Vierecke
+# stur ueber die Ecken 0-2 und groessere Flaechen per Delaunay ueber die Eckpunkte, behalten wird,
+# was mit dem Schwerpunkt innen liegt. Bei konkaven Flaechen fehlen so Teile oder ragen hinaus (Gondel:
+# eine Wand verlor 10 % ihrer Flaeche), und ein Zwischenpunkt auf einer Kante ergibt ein Dreieck ohne
+# Flaeche, das der SKP-Writer verwirft. Hier: eingeschraenkte Delaunay-Triangulierung, die die Kanten
+# einhaelt, in der Projektion und mit dem Umlaufsinn von OpenSKP. Einfache Faelle bleiben bei OpenSKP.
+_openskp_core_module = _importlib.import_module("openskp._core")
+if not callable(getattr(_openskp_core_module, "triangulate_face_3d", None)):
+    raise ImportError("OpenSKP-Version passt nicht zu skptool: openskp._core.triangulate_face_3d fehlt. "
+                      "Getestet mit 1.2.0.")
+_triangulate_face_openskp = _openskp_core_module.triangulate_face_3d
+
+
+def _triangulate_face_3d(vertices_3d, loops, normal):
+    if len(loops) == 1 and len(loops[0]) == 3:
+        return _triangulate_face_openskp(vertices_3d, loops, normal)
+    try:
+        tris = _constrained_face_triangles(vertices_3d, loops, normal)
+    except Exception:  # noqa: BLE001 - dann wie bisher
+        tris = None
+    return tris or _triangulate_face_openskp(vertices_3d, loops, normal)
+
+
+def _constrained_face_triangles(vertices_3d, loops, normal):
+    """Dreiecke als Punkt-ID-Listen oder None (dann triangulate_face_3d von OpenSKP)."""
+    import shapely
+    from shapely.geometry import Polygon
+
+    n = np.asarray(normal, np.float64)
+    length = np.linalg.norm(n)
+    n = n / length if length > 1e-6 else np.array([0.0, 0.0, 1.0])
+    u = np.cross(n, [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0])  # wie OpenSKP
+    u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+    ids = [i for lp in loops for i in lp]
+    if any(i not in vertices_3d for i in ids):
+        return None
+    xy = {i: (float(np.dot(vertices_3d[i], u)), float(np.dot(vertices_3d[i], v))) for i in ids}
+    rings = [[xy[i] for i in lp] for lp in loops]
+
+    def signed_area(ring):
+        return sum(ax * by - bx * ay for (ax, ay), (bx, by) in zip(ring, ring[1:] + ring[:1])) / 2
+
+    sign = 1.0 if signed_area(rings[0]) >= 0 else -1.0  # Umlaufsinn der Aussenschleife beibehalten
+    if len(loops) == 1 and len(rings[0]) == 4:
+        # klar konvexes Viereck (kein Punkt fast auf einer Geraden): dieselbe Zerlegung wie OpenSKP
+        pts = rings[0]
+        whole = abs(signed_area(pts))
+        if all(sign * signed_area([pts[k - 1], pts[k], pts[(k + 1) % 4]]) > 1e-6 * whole for k in range(4)):
+            return None
+    poly = Polygon(rings[0], rings[1:])
+    if not poly.is_valid:  # z. B. Schleifen, die sich in einem Punkt beruehren
+        parts = shapely.get_parts(shapely.get_parts(shapely.make_valid(poly)))  # auch aus Sammlungen
+        poly = shapely.MultiPolygon([p for p in parts if p.geom_type == "Polygon"])
+    if poly.area <= 0:
+        return None
+    by_xy = {}
+    for i in ids:
+        by_xy.setdefault(xy[i], i)
+    tris = []
+    for tri in shapely.constrained_delaunay_triangles(poly).geoms:
+        corners = list(tri.exterior.coords)[:3]
+        tid = [by_xy.get(c) for c in corners]
+        if None in tid or len(set(tid)) < 3:
+            return None
+        if sign * signed_area(corners) < 0:
+            tid = [tid[0], tid[2], tid[1]]
+        tris.append(tid)
+    return tris
+
+
+_openskp_core_module.triangulate_face_3d = _triangulate_face_3d
+
 INCH = 0.0254  # SketchUp speichert intern in Zoll
-NATIVE_FORMATS = {".glb", ".obj", ".stl", ".ply", ".dxf", ".ifc", ".json"}
+NATIVE_FORMATS = {".glb", ".obj", ".stl", ".ply", ".dxf", ".ifc", ".json", ".3mf"}
 BLENDER_OUT_FORMATS = {".blend", ".fbx", ".usd", ".usda", ".usdc", ".usdz", ".abc", ".gltf", ".png"}
 BLENDER_IN_FORMATS = {".blend", ".glb", ".gltf", ".fbx", ".obj", ".stl", ".ply",
                       ".usd", ".usda", ".usdc", ".usdz", ".abc"}
@@ -228,6 +301,14 @@ def export_native(skp: SkpFile, out: Path, textures: bool = True) -> Path:
         write_instanced_glb(m, instanced_scene.build_instanced_scene(skp._parsed), _instance_info(m), out,
                             textures=textures)
         return out
+    if ext == ".3mf":  # 3D-Druck: Millimeter, Z oben, eindeutige Netze einmal, Hinweise auf stderr
+        from openskp import instanced_scene
+
+        from skptool.export_3mf import write_3mf
+
+        write_3mf(model_of(skp), instanced_scene.build_instanced_scene(skp._parsed), out,
+                  max_components=MAX_PLACEMENTS)
+        return out
     scene = build_scene(skp)
     if ext == ".obj":
         obj.export(scene, out)
@@ -299,6 +380,7 @@ def export_for_blender(skp: SkpFile, glb_path: Path, meta_path: Path, textures: 
     hard = stats.pop("hard_edges", {})
     meta = {
         "hard_edges": hard,
+        "soft_edges": stats.pop("soft_edges", {}),
         "layers": [{"name": l.name, "hidden": bool(l.hidden)} for l in m.layers],
         "materials": [{"name": mt.name, "rgb": list(mt.color[:3]) if mt.color else [255, 255, 255],
                        "alpha": mt.transparency if mt.transparency is not None else 1.0,
@@ -552,6 +634,68 @@ def _replay_materials(builder, model, warnings):
     return slots
 
 
+def _edge_points(defn):
+    """(Kante, p, q) je Kante mit zwei verschiedenen Endpunkten, Punkte wie in edit._replay_face."""
+    for e in defn.edges.values():
+        v1, v2 = defn.vertices.get(e.v1_id), defn.vertices.get(e.v2_id)
+        if v1 is None or v2 is None:
+            continue
+        p = (float(v1.x), float(v1.y), float(v1.z))
+        q = (float(v2.x), float(v2.y), float(v2.z))
+        if p != q:
+            yield e, p, q
+
+
+def _predeclare_edges(target, defn) -> int:
+    """Alle Kanten einer Definition mit ihren eigenen Flags vor den Flaechen anlegen.
+
+    edit._replay_face setzt weich/glatt/verborgen je FLAECHE ("irgendeine Randkante ist weich"),
+    und der Writer vergibt die Flags nur an Kanten, die ein add_face-Aufruf NEU anlegt: eine
+    Flaeche mit einer weichen Kante machte so alle ihre neuen Kanten weich, wer zuerst kam,
+    bestimmte die Kante. Vorab angelegt behaelt jede Kante ihre Flags, add_face findet sie im
+    Kantenregister und aendert sie nicht mehr. Lose Kanten (ohne Flaeche), die edit gar nicht
+    uebertraegt, kommen dabei mit. Rueckgabe: Zahl der geschriebenen Kanten."""
+    if isinstance(target, SkpBuilder):
+        target._ensure_geometry_writer()
+        writer = target._geometry_writer
+    else:
+        writer = target._skp._definition_writer
+    count = 0
+    for e, p, q in _edge_points(defn):
+        _, _, new = writer._write_edge_chain([p, q], target._vertex_slots, target._edge_registry, False,
+                                             e.hidden, e.soft, e.smooth)
+        target._new_entity_count += new
+        count += new
+    if count and isinstance(target, SkpBuilder):
+        target._face_count += 1  # wie add_polyline: "mindestens ein Objekt im Modell"
+    return count
+
+
+class _SoftDiagonals:
+    """add_face mit weichen, glatten Kanten fuer alles, was erst dort entsteht.
+
+    Nach _predeclare_edges sind das nur noch die Diagonalen, die beim Zerlegen einer unebenen
+    Flaeche entstehen. SketchUp glaettet solche Diagonalen selbst, wie der Blender-Weg."""
+
+    def __init__(self, target):
+        self._target = target
+
+    def add_face(self, points, **kwargs):
+        kwargs.update(soft_edges=True, smooth_edges=True, hidden_edges=False)
+        return self._target.add_face(points, **kwargs)
+
+
+def _replay_body(target, defn, model, material_slots, layer_slots, warnings, context, def_builders, stats):
+    """Wie edit._replay_body, aber mit den Kantenflags je Kante statt je Flaeche."""
+    stats["edges"] = stats.get("edges", 0) + _predeclare_edges(target, defn)
+    edges = _edit._edge_map(defn)
+    faces = _SoftDiagonals(target)
+    for face in defn.faces.values():
+        _edit._replay_face(faces, face, defn, edges, model, material_slots, warnings, context)
+    for inst in defn.instances:
+        _edit._replay_instance(target, inst, def_builders, material_slots, layer_slots, model, warnings, context)
+
+
 def rewrite_legacy(src: Path, out: Path) -> dict:
     """Beliebige lesbare .skp (auch 2021+) als SketchUp-2017-Datei neu aufbauen.
 
@@ -578,15 +722,15 @@ def rewrite_legacy(src: Path, out: Path) -> dict:
         for def_id in _edit._definition_order(model):
             defn = model.definitions[def_id]
             context = f"definition {defn.name or def_id!r}"
-            if not _edit._definition_has_content(defn, def_builders):
+            if not (_edit._definition_has_content(defn, def_builders) or any(_edge_points(defn))):
                 warnings.append(f"{context}: uebersprungen (keine Geometrie)")
                 continue
             with builder.add_component_definition(defn.name) as db:
-                _edit._replay_body(db, defn, model, material_slots, layer_slots, warnings, context,
-                                   def_builders)
+                _replay_body(db, defn, model, material_slots, layer_slots, warnings, context,
+                             def_builders, stats)
             def_builders[def_id] = db
-        _edit._replay_body(builder, model.root, model, material_slots, layer_slots, warnings, "root",
-                           def_builders)
+        _replay_body(builder, model.root, model, material_slots, layer_slots, warnings, "root",
+                     def_builders, stats)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_atomic(builder, out)
     check = SkpFile.open(str(out)).parse()
@@ -956,10 +1100,11 @@ def write_skp_from_bin(header_path: Path, out: Path, scale_to_inch: float | None
     instances = header["instances"]
     layer_ids = {}
     all_layers = {o["layer"] for o in instances if o["layer"]} | set(header.get("layers", []))
+    hidden_layers = set(header.get("hidden_layers", []))
     for name in sorted(all_layers):  # auch Ebenen ohne Objekte, sie gehoeren zum Modell
         if name in ("Layer0", "Untagged", "Scene Collection"):
             continue
-        layer_ids[name] = b.add_layer(name)
+        layer_ids[name] = b.add_layer(name, hidden=name in hidden_layers)
 
     def inst_kwargs(inst):
         t, m9 = _placement(inst["matrix"], factor)

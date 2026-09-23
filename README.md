@@ -16,6 +16,8 @@
 - **Rundreise über Blender:** Komponenten, Gruppen in Gruppen, Tags, Materialien, Texturen (vorne und hinten), Deckkraft, harte und weiche Kanten bleiben erhalten.
 - **Bearbeiten per Befehl** mit einer festen Liste von Operationen (verschieben, drehen, skalieren, einfärben, kopieren, löschen, ...), ohne Blender-Kenntnisse.
 - **Live-Bearbeitung** im offenen Blender-Fenster: Befehle wirken sofort, jedes Speichern schreibt automatisch die `.skp`. Gedacht auch für Skripte und KI-Assistenten.
+- **MCP-Server** für KI-Assistenten wie Claude: `skptool mcp` stellt Lesen, Vergleichen, Umwandeln, Bearbeiten und die Live-Steuerung als Werkzeuge bereit.
+- **3MF für den 3D-Druck**, direkt ohne Blender.
 - **Neue Dateien ins 2017-Format umschreiben**, damit ältere Programme sie öffnen.
 - **Für fremde Dateien gebaut:** keine Codeausführung, keine Netzwerkzugriffe, keine fremden lokalen Dateien in der Ausgabe. Details in [SECURITY.md](SECURITY.md).
 
@@ -61,7 +63,7 @@ Die Endung der Zieldatei bestimmt das Format. Stapelbetrieb mit Muster, Format u
 skptool convert "projekte\*.skp" -f glb -d export
 ```
 
-Vorhandene Zieldateien überschreibt der Stapelbetrieb nur mit `--force`.
+Vorhandene Zieldateien überschreibt der Stapelbetrieb nur mit `--force`. Mit `--jobs auto` (oder `--jobs N`) laufen mehrere Dateien gleichzeitig, jede in einem eigenen Prozess. Ein Speicherwächter schätzt den Bedarf jeder Datei (grob 100-mal die Dateigröße, mit Blender 0,5 GB mehr) und startet nur so viele Prozesse, dass zusammen höchstens 70 Prozent des freien Arbeitsspeichers belegt sind, große Dateien laufen allein. Strg+C beendet alle Prozesse samt Blender. Das lohnt sich ab etwa einer Sekunde pro Datei (Blender-Ziele, größere Modelle), viele winzige Dateien nach `.glb` sind nacheinander schneller.
 
 ```bash
 skptool open haus.skp
@@ -112,7 +114,20 @@ Wendet eine Liste von Operationen an und schreibt das Ergebnis in jedem Ausgabef
 ]
 ```
 
-Operationen: `list`, `summary`, `move`, `rotate`, `scale`, `set_material`, `recolor`, `set_layer`, `hide_layer`, `show_layer`, `delete`, `rename`, `duplicate`, `add_box`. Einheiten sind Meter und Grad, z zeigt nach oben. Die genaue Beschreibung steht in [`ops.py`](skptool/blender_scripts/ops.py). Keine Operation führt Code aus oder greift auf Dateien zu. Schlägt eine Operation fehl, wird nichts geschrieben.
+Operationen: `list`, `summary`, `measure`, `move`, `rotate`, `scale`, `mirror`, `align`, `distribute`, `set_material`, `recolor`, `set_layer`, `hide_layer`, `show_layer`, `hide`, `show`, `delete`, `rename`, `duplicate`, `array`, `add_box`. Einheiten sind Meter und Grad, z zeigt nach oben. Die Box eines Objekts umfasst immer seinen ganzen Inhalt, wie bei einer SketchUp-Gruppe.
+
+```json
+[
+  {"op": "align", "select": {"name": "Stuhl*"}, "axis": "y", "to": "max", "to_object": {"name": "Tisch"}},
+  {"op": "distribute", "select": {"name": "Stuhl*"}, "axis": "x", "gap": 0.2},
+  {"op": "array", "select": {"name": "Stuhl"}, "counts": [3, 2, 1], "spacing": [0.6, 0.5, 0]},
+  {"op": "mirror", "select": {"name": "Regal"}, "axis": "x"},
+  {"op": "hide", "select": {"name": "Deko*"}},
+  {"op": "measure", "select": {"name": "Tisch"}, "to_object": {"name": "Sofa"}}
+]
+```
+
+`align` richtet an `min`, `center` oder `max` der gemeinsamen Box aus oder an einem Bezugsobjekt (`to_object`). `distribute` verteilt nach Mitten oder mit fester Lücke (`gap`). `array` legt verknüpfte Kopien im Raster an. `mirror` spiegelt an der Ebene durch `pivot` (`self`, `group`, `origin` oder `[x, y, z]`), die Geometrie bleibt geteilt. `hide` und `show` blenden einzelne Objekte samt Inhalt aus oder ein, in der `.skp` ist dann die äußere Gruppe verborgen. `measure` ändert nichts und meldet Größe, Mitte und Abstand. Die genaue Beschreibung steht in [`ops.py`](skptool/blender_scripts/ops.py). Keine Operation führt Code aus oder greift auf Dateien zu. Schlägt eine Operation fehl, wird nichts geschrieben.
 
 **Windows PowerShell 5.1:** JSON-Text in Anführungszeichen (`--ops '[...]'`) kommt dort kaputt an, weil PowerShell die inneren Anführungszeichen entfernt. Dort eine `.json`-Datei verwenden oder die Datei übergeben: `Get-Content aenderungen.json -Raw | skptool edit haus.skp -o haus_neu.skp --ops -`. Für Umlaute in Namen vorher `$OutputEncoding = [Text.Encoding]::UTF8` setzen. PowerShell 7, cmd und Bash sind nicht betroffen.
 
@@ -132,16 +147,43 @@ skptool live --status
 skptool live --quit
 ```
 
-Jedes Speichern, per Strg+S oder `live --save`, schreibt im Hintergrund `haus_bearbeitet.skp`. Gibt es die Datei schon, verlangt `skptool` ein ausdrückliches `--export-skp haus_bearbeitet.skp`. Das Original wird nie überschrieben. `--screenshot` zeigt mit `--view model` das ganze Modell, mit `viewport` die 3D-Ansicht wie gerade zu sehen und mit `window` das ganze Fenster. `--json` liefert alle Antworten maschinenlesbar. Ein kleiner Befehl dauert etwa 25 ms, auch bei einem Modell mit 632.000 Flächen. Die Verbindung ist nur auf diesem Rechner erreichbar und durch gegenseitige Anmeldung geschützt.
+Jedes Speichern, per Strg+S oder `live --save`, schreibt im Hintergrund `haus_bearbeitet.skp`. Gibt es die Datei schon, verlangt `skptool` ein ausdrückliches `--export-skp haus_bearbeitet.skp`. Das Original wird nie überschrieben. `--screenshot` zeigt mit `--view model` das ganze Modell (mit `--select "Stuhl*"` nur die Auswahl), mit `viewport` die 3D-Ansicht wie gerade zu sehen und mit `window` das ganze Fenster. `--json` liefert alle Antworten maschinenlesbar. Ein kleiner Befehl dauert etwa 25 ms, auch bei einem Modell mit 632.000 Flächen. Die Verbindung ist nur auf diesem Rechner erreichbar und durch gegenseitige Anmeldung geschützt.
+
+### Für KI-Assistenten (MCP)
+
+```bash
+skptool mcp
+```
+
+Startet einen MCP-Server (Model Context Protocol) über stdio. Claude Code, Claude Desktop und andere MCP-Clients nutzen skptool dann direkt als Werkzeuge: `skp_info`, `skp_list`, `skp_diff`, `skp_report`, `skp_convert`, `skp_edit` sowie `live_status`, `live_ops`, `live_screenshot` und `live_undo` für ein mit `skptool open datei.skp --live` gestartetes Blender.
+
+Claude Code:
+
+```bash
+claude mcp add skptool -- "C:\Pfad\zu\skptool\skptool.cmd" mcp
+```
+
+Claude Desktop (`%APPDATA%\Claude\claude_desktop_config.json`):
+
+```json
+{"mcpServers": {"skptool": {
+  "command": "C:\\Pfad\\zu\\skptool\\.venv\\Scripts\\python.exe",
+  "args": ["-P", "-m", "skptool", "mcp"],
+  "env": {"PYTHONPATH": "C:\\Pfad\\zu\\skptool"}}}}
+```
+
+`--nur-lesen` bietet nur die lesenden Werkzeuge an, `--ordner D:\Projekte` (mehrfach möglich) lässt nur Dateien in diesen Ordnern zu, `--timeout SEKUNDEN` begrenzt jeden Aufruf (Standard 900). Schreibende Werkzeuge überschreiben nie vorhandene Dateien, außer ausdrücklich mit `ueberschreiben`, und nie eine Eingabe. Prüfen ohne Client: `.venv\Scripts\python tools\mcp_testclient.py`.
 
 ## Formate
 
 | Richtung | Formate | Weg |
 |---|---|---|
-| `.skp` nach | `.glb` `.obj` `.stl` `.ply` `.dxf` `.ifc` `.json` | direkt mit OpenSKP, ohne Blender |
+| `.skp` nach | `.glb` `.obj` `.stl` `.ply` `.dxf` `.ifc` `.json` `.3mf` | direkt mit OpenSKP, ohne Blender |
 | `.skp` nach | `.blend` `.fbx` `.usd` `.usdz` `.abc` `.gltf` `.png` | über Blender im Hintergrund |
 | nach `.skp` | aus `.blend` `.glb` `.gltf` `.fbx` `.obj` `.stl` `.ply` `.usd*` `.abc` | über Blender, geschrieben als SketchUp-2017-Datei |
 | `.skp` nach `.skp` | jede lesbare Version, auch 2026 | als SketchUp-2017-Datei neu aufgebaut, ohne Blender |
+
+**3MF für den 3D-Druck** (PrusaSlicer, Bambu Studio, Cura): Millimeter, z oben. Jede Komponente steht einmal in der Datei, Platzierungen verweisen darauf, der Slicer sieht ein Objekt aus mehreren Teilen. Farben als Materialfarben, keine Texturen. SketchUp-Rückseiten werden weggelassen, sonst sähe der Slicer doppelte Flächen ohne Volumen. skptool repariert keine Netze: offene Teile stehen als Hinweis auf der Konsole, damit klar ist, warum ein Slicer sich beschwert.
 
 ## Sicherheit
 
@@ -219,7 +261,7 @@ Die Zeit steckt fast vollständig im Einlesen durch OpenSKP in Python. Die Optim
 .venv\Scripts\python -m unittest discover -s tests -v
 ```
 
-145 Tests in `tests/`: Grundfunktionen, Sicherheit, Live-Modus, `diff`, `report`, Aufruf von überall, OpenSKP-Vertrag und Stil. Die Live-Tests öffnen kurz ein kleines Blender-Fenster, `SKPTOOL_SKIP_GUI_TESTS=1` überspringt das. Ohne Blender werden die Blender-Tests übersprungen.
+223 Tests in `tests/`: Grundfunktionen, Sicherheit, Live-Modus, MCP-Server, `diff`, `report`, 3MF, Stapelbetrieb, Bearbeitungsoperationen, Rundreise-Geometrie, Kanten, Aufruf von überall, OpenSKP-Vertrag und Stil.
 
 Einige Tests brauchen zwei zusätzliche Beispieldateien aus dem OpenSKP-Repository. Sie enthalten Inhalte Dritter und liegen deshalb nicht bei. Laden (fester Stand, per SHA-256 geprüft):
 
@@ -244,6 +286,8 @@ Ohne sie werden diese Tests übersprungen.
 | `skptool/opsjson.py` | liest und prüft `--ops` |
 | `skptool/vergleich.py` | `skptool diff`, auch Grundlage für den Geometrie- und Texturvergleich in `tools/` |
 | `skptool/bericht.py` | `skptool report` |
+| `skptool/mcp_server.py` | `skptool mcp`, der MCP-Server für KI-Assistenten |
+| `skptool/export_3mf.py` | 3MF-Export |
 | `tools/` | Hilfsskripte: Aufruf von überall einrichten, Texturvergleich, Geometrievergleich, Verschachtelung als Baum, Texturtestszene, Beispiele laden |
 
 ## Versionen

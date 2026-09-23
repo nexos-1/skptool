@@ -5,7 +5,9 @@ Beispiele:
   skptool info haus.skp
   skptool convert haus.skp -o haus.blend          # zum Bearbeiten in Blender
   skptool convert haus.skp -o haus.glb            # glTF, direkt ohne Blender
+  skptool convert haus.skp -o haus.3mf            # 3D-Druck (Slicer), Millimeter, ohne Blender
   skptool convert *.skp -f fbx -d export\\         # Stapelkonvertierung
+  skptool convert *.skp -f glb -d export\\ -j auto # dasselbe mit mehreren Prozessen gleichzeitig
   skptool open haus.skp                           # .blend erzeugen und Blender oeffnen
   skptool convert haus.blend -o haus_neu.skp      # nach dem Bearbeiten zurueck nach SketchUp
   skptool convert haus_2026.skp -o haus_2017.skp  # neue Datei ins 2017-Format umschreiben
@@ -25,7 +27,7 @@ import time
 from pathlib import Path
 
 from skptool import __version__
-from skptool import core
+from skptool import core, stapel
 from openskp import SkpFile
 
 from skptool.blender import BlenderError, launch_gui, run_bridge
@@ -296,6 +298,11 @@ def cmd_convert(a) -> int:
         if len(plan) > 1 and dst.exists() and not getattr(a, "force", False):
             raise SystemExit(f"{dst} gibt es schon. Ueberschreiben mit --force, sonst anderen Zielordner (-d). "
                              "Nichts geschrieben.")
+    jobs = getattr(a, "jobs", 1)
+    if len(plan) > 1 and jobs != 1:  # alle Pruefungen oben sind durch, erst jetzt startet ein Arbeitsprozess
+        rc = stapel.ausfuehren(plan, a, jobs)
+        if rc is not None:
+            return rc
     rc = 0
     for src, dst in plan:
         t = time.time()
@@ -471,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_info)
 
     p = sub.add_parser("convert", parents=[common], help="Konvertieren (skp <-> glb/obj/fbx/blend/...)",
-                       description="Ziel .glb .obj .stl .ply .dxf .ifc .json direkt; .blend .fbx .usd(z) "
+                       description="Ziel .glb .obj .stl .ply .dxf .ifc .json .3mf direkt; .blend .fbx .usd(z) "
                                    ".abc .gltf .png ueber Blender; .skp aus .skp (2017-Format) oder aus "
                                    "jeder Blender-lesbaren Datei.")
     p.add_argument("inputs", nargs="+")
@@ -480,6 +487,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-d", "--outdir", help="Zielordner fuer Stapelbetrieb")
     p.add_argument("--force", action="store_true",
                    help="Stapelbetrieb: vorhandene Zieldateien ueberschreiben")
+    p.add_argument("-j", "--jobs", type=stapel.jobs_wert, default=1, metavar="N",
+                   help="Stapelbetrieb: bis zu N Dateien gleichzeitig in eigenen Prozessen (0 oder auto: so "
+                        "viele wie Kerne). Grosse Dateien laufen allein, damit der Arbeitsspeicher reicht. "
+                        "Standard 1")
     p.set_defaults(func=cmd_convert)
 
     p = sub.add_parser("render", parents=[common], help="PNG-Vorschaubild rendern")
@@ -498,9 +509,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("edit", parents=[common], help="Modell per Operationen bearbeiten",
-                       description="Operationen als JSON (Text oder .json-Datei): list, summary, move, rotate, "
-                                   "scale, set_material, recolor, set_layer, hide_layer, show_layer, delete, "
-                                   "rename, duplicate, add_box. Beschreibung in skptool/blender_scripts/ops.py.")
+                       description="Operationen als JSON (Text oder .json-Datei): list, summary, measure, move, "
+                                   "rotate, scale, mirror, align, distribute, set_material, recolor, set_layer, "
+                                   "hide_layer, show_layer, hide, show, delete, rename, duplicate, array, add_box. "
+                                   "Beschreibung in skptool/blender_scripts/ops.py.")
     p.add_argument("input")
     p.add_argument("-o", "--output", required=True)
     p.set_defaults(func=cmd_edit)
@@ -518,9 +530,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     from skptool import live
     live.add_live_parser(sub)
-    from skptool import bericht, vergleich
+    from skptool import bericht, mcp_server, vergleich
     bericht.add_report_parser(sub)
     vergleich.add_diff_parser(sub)
+    mcp_server.add_mcp_parser(sub)
     return ap
 
 
