@@ -363,7 +363,8 @@ class TestServerSchalter(unittest.TestCase):
             self.assertEqual(c.schliessen(), 0)
 
     def test_timeout_ends_call_with_error(self):
-        c = Client("--timeout", "0.3")
+        # 0,01 s: so kurz, dass selbst auf schnellen Rechnern (CI) kein Worker rechtzeitig fertig wird
+        c = Client("--timeout", "0.01")
         try:
             c.init()
             t = time.time()
