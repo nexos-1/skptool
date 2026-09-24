@@ -168,11 +168,13 @@ def _mat_image(mat):
 def _backface_duplicates(me, slot_default, slot_textured=None):
     """Indizes der Flaechen, die als Vorder-/Rueckseiten-Duplikat wegfallen (numpy, O(n log n)).
 
-    Gleiche Regel wie die fruehere Python-Schleife: Schluessel einer Flaeche ist die sortierte
-    Liste ihrer auf 5 Stellen gerundeten Eckkoordinaten. Je Gruppe gleicher Schluessel bleibt die
-    erste texturierte Flaeche, sonst die erste bemalte, sonst die erste ueberhaupt. Texturen
-    zuerst, weil nur die behaltene Seite ihre Texturkoordinaten mitnimmt; eine reine Farbe auf
-    der anderen Seite braucht keine und geht als Rueckseitenmaterial mit.
+    Schluessel einer Flaeche ist die sortierte Liste ihrer auf 5 Stellen gerundeten Eckkoordinaten.
+    Je Gruppe gleicher Schluessel bleibt die erste texturierte Flaeche, sonst die erste ueberhaupt:
+    skptool.core ordnet die Vorderseiten in der GLB vor die Rueckseiten, so bleibt die Vorderseite
+    vorne, auch wenn sie unbemalt ist und nur die Rueckseite Farbe hat (frueher gewann die bemalte
+    Seite und die Flaeche drehte sich um). Texturen zuerst, weil nur die behaltene Seite ihre
+    Texturkoordinaten mitnimmt; eine reine Farbe auf der anderen Seite braucht keine und geht als
+    Rueckseitenmaterial mit.
     """
     npoly = len(me.polygons)
     if npoly < 2:
@@ -198,10 +200,9 @@ def _backface_duplicates(me, slot_default, slot_textured=None):
     me.polygons.foreach_get("loop_total", lt)
     mi = np.empty(npoly, np.int32)
     me.polygons.foreach_get("material_index", mi)
-    sd = np.array(list(slot_default) + [False], bool)
     st = np.array(list(slot_textured or [False] * len(slot_default)) + [False], bool)
     mic = np.clip(mi, 0, len(slot_default))
-    priority = np.where(st[mic], 0, np.where(sd[mic], 2, 1))  # 0 Textur, 1 Farbe, 2 unbemalt
+    priority = np.where(st[mic], 0, 1)  # 0 Textur, sonst die zuerst stehende (Vorderseite)
     doomed, keepers = [], []
     for n in np.unique(lt).tolist():
         f = np.flatnonzero(lt == n)
@@ -363,6 +364,78 @@ def _clean_mesh(me, default_mats, keep_triangles, hard=None, soft=None):
     return len(doomed)
 
 
+COLORIZE_PREFIX = "skp_colorize"  # Knotennamen der Toenungsanzeige
+
+
+def _colorize_nodes(mat):
+    """Anzeige einer getoenten SketchUp-Textur (Colorize) in Blender.
+
+    Das Bild bleibt unveraendert, die Toenung haengt als Eigenschaften am Material
+    (skp_colorize_type 0 = Farbton verschieben, 1 = einfaerben; skp_colorize_rgb Zielfarbe;
+    skp_colorize_deltas Abweichung h in Grad, l, s von der Bild-Durchschnittsfarbe, berechnet in
+    skptool/einfaerben.py). Der Rueckweg nach .skp schreibt Bild und Toenung wieder als eingefaerbte
+    Textur. Die Knoten rechnen je Pixel wie SketchUp im HLS-Raum (Trimbles Verfahren, siehe
+    einfaerben.py), aber mit Gamma 2.2 statt der genauen sRGB-Kurve und Farbton 0 statt "keiner"
+    bei grauen Pixeln: fuer die Anzeige genau genug. Rueckgabe: True, wenn Knoten eingefuegt."""
+    node = _principled(mat)
+    deltas, rgb = mat.get("skp_colorize_deltas"), mat.get("skp_colorize_rgb")
+    if node is None or rgb is None or len(rgb) != 3:
+        return False
+    color = tuple(float(c) / 255 for c in rgb)
+    base = node.inputs["Base Color"]
+    mat.diffuse_color = (*color, mat.diffuse_color[3])
+    if not base.is_linked or deltas is None or len(deltas) != 3:
+        base.default_value = (*color, 1.0)
+        return False
+    if any(n.name.startswith(COLORIZE_PREFIX) for n in mat.node_tree.nodes):
+        return False  # schon vorhanden (Datei erneut importiert)
+    dh, dl, ds = (float(v) for v in deltas)
+    tint = int(mat.get("skp_colorize_type", 0)) == 1
+    nt = mat.node_tree
+    src = base.links[0].from_socket
+    x0, y0 = node.location.x - 900, node.location.y
+
+    def add(kind, label, dx, dy=0, **props):
+        n = nt.nodes.new(kind)
+        n.name = n.label = f"{COLORIZE_PREFIX} {label}"
+        n.location = (x0 + dx, y0 + dy)
+        for k, v in props.items():
+            setattr(n, k, v)
+        return n
+
+    def rechne(label, op, a, b, dx, dy, clamp=False):
+        n = add("ShaderNodeMath", label, dx, dy, operation=op, use_clamp=clamp)
+        for i, v in enumerate((a, b)):
+            if isinstance(v, (int, float)):
+                n.inputs[i].default_value = v
+            else:
+                nt.links.new(v, n.inputs[i])
+        return n.outputs[0]
+
+    to_srgb = add("ShaderNodeGamma", "sRGB", 0)
+    to_srgb.inputs["Gamma"].default_value = 1 / 2.2
+    nt.links.new(src, to_srgb.inputs["Color"])
+    sep = add("ShaderNodeSeparateColor", "HSL", 180, 0, mode="HSL")
+    nt.links.new(to_srgb.outputs[0], sep.inputs[0])
+    if tint:  # Einfaerben: fester Farbton
+        h = rechne("Farbton", "FRACT", dh / 360.0, 0.0, 540, 150)
+    else:  # Verschieben: Farbton plus Abweichung, im Kreis
+        h = rechne("Farbton", "FRACT", rechne("Farbton+", "ADD", sep.outputs[0], dh / 360.0, 360, 150),
+                   0.0, 540, 150)
+    s = rechne("Saettigung", "ADD", sep.outputs[1], ds, 360, 0, clamp=True)
+    lum = rechne("Helligkeit", "MAXIMUM",
+                 rechne("Helligkeit+", "ADD", sep.outputs[2], dl, 360, -150, clamp=True), 0.01, 540, -150)
+    comb = add("ShaderNodeCombineColor", "HSL zurueck", 720, 0, mode="HSL")
+    for i, sock in enumerate((h, s, lum)):
+        nt.links.new(sock, comb.inputs[i])
+    to_lin = add("ShaderNodeGamma", "linear", 900, 0)
+    to_lin.inputs["Gamma"].default_value = 2.2
+    nt.links.new(comb.outputs[0], to_lin.inputs["Color"])
+    nt.links.new(to_lin.outputs[0], base)
+    base.default_value = (*color, 1.0)  # falls jemand das Bild entfernt
+    return True
+
+
 def _paint_material(paint, by_name):
     mat = bpy.data.materials.get(paint)
     if mat is None and paint in by_name:
@@ -391,6 +464,11 @@ def fix_up_skp_import(meta, keep_triangles=False):
             node.inputs["Alpha"].default_value = mat.diffuse_color[3]  # Glas auch in Eevee/Cycles
         if mat.get("skp_default") or mat.name.rsplit(".", 1)[0] == DEFAULT_MAT:
             default_mats.add(mat.name)
+        color = mat.get("skp_color")  # Texturmaterial: SketchUp-Farbe fuer die Volltonansicht
+        if color is not None and len(color) == 3:
+            mat.diffuse_color = (*(float(c) / 255 for c in color), mat.diffuse_color[3])
+    colorized = sum(1 for mat in bpy.data.materials
+                    if mat.get("skp_colorize_type") is not None and _colorize_nodes(mat))
     _lap("materials")
 
     # Ebenen (Tags) als Collections
@@ -456,8 +534,25 @@ def fix_up_skp_import(meta, keep_triangles=False):
     for mat in list(bpy.data.materials):
         if mat.users == 0:
             bpy.data.materials.remove(mat)
+    # Materialien, die im SketchUp-Modell stehen, aber auf keiner platzierten Flaeche (SketchUp
+    # behaelt sie bis zum Bereinigen): als Farbmaterial mit Fake-User, damit Blender sie speichert
+    # und der Rueckweg sie wieder schreibt. Texturmaterialien fehlen hier, ihr Bild steckt nicht
+    # in der GLB.
+    present = {_BLENDER_SUFFIX.sub("", m.name) for m in bpy.data.materials}
+    unused = 0
+    for src in meta["materials"]:
+        name = src.get("name")
+        if not name or name in present or name == DEFAULT_MAT or src.get("textured"):
+            continue
+        mat = _paint_material(name, by_name)
+        if mat is not None:
+            mat.use_fake_user = True
+            mat["skp_unused"] = True
+            present.add(name)
+            unused += 1
     _lap("inherited_paint+mat_cleanup")
-    return {"backface_duplicates_removed": removed, "inherited_paint_slots": inherited}
+    return {"backface_duplicates_removed": removed, "inherited_paint_slots": inherited,
+            "colorized_materials": colorized, "unused_materials_kept": unused}
 
 
 # ---------------------------------------------------------------- Vorschaubild
@@ -521,6 +616,19 @@ def render_preview(path, width, height):
 
 # ---------------------------------------------------------------- Dump fuer den SKP-Writer
 
+def _alpha_factor(node):
+    """Deckkraft einer durchscheinenden Textur: der glTF-Import verbindet Alpha mit "Bild-Alpha mal
+    Faktor" (Math MULTIPLY), der Faktor steht dann nirgends sonst. None, wenn nicht so verbunden."""
+    sock = node.inputs.get("Alpha")
+    if sock is None or not sock.is_linked:
+        return None
+    src = sock.links[0].from_node
+    if src.type != "MATH" or src.operation != "MULTIPLY":
+        return None
+    consts = [float(i.default_value) for i in src.inputs[:2] if not i.is_linked]
+    return min(consts) if len(consts) == 1 and 0.0 <= consts[0] <= 1.0 else None
+
+
 class _MaterialTable:
     """Materialtabelle des Dumps; Texturen werden beim ersten Gebrauch als PNG gespeichert."""
 
@@ -553,6 +661,9 @@ class _MaterialTable:
             if "Alpha" in node.inputs and not node.inputs["Alpha"].is_linked:
                 alpha = min(alpha, float(node.inputs["Alpha"].default_value))
             alpha = min(alpha, float(node.inputs["Base Color"].default_value[3]))
+            factor = _alpha_factor(node)
+            if factor is not None:
+                alpha = min(alpha, factor)
         image_path = None
         img = _mat_image(mat)
         if img is not None:
@@ -583,7 +694,15 @@ class _MaterialTable:
             if image_path and not os.path.exists(image_path):
                 image_path = None
         self.index[mat.name] = self.by_look[look] = len(mats)
-        mats.append({"name": base, "rgba": [*rgb, 255], "alpha": alpha, "image": image_path})
+        entry = {"name": base, "rgba": [*rgb, 255], "alpha": alpha, "image": image_path}
+        # Getoente SketchUp-Textur (siehe _colorize_nodes): Bild ist das Original, Toenung mitgeben
+        ctype, crgb = mat.get("skp_colorize_type"), mat.get("skp_colorize_rgb")
+        if image_path and ctype is not None and crgb is not None and len(crgb) == 3:
+            try:
+                entry["colorize"] = {"type": int(ctype), "rgb": [max(0, min(255, int(c))) for c in crgb]}
+            except (TypeError, ValueError):
+                pass
+        mats.append(entry)
         return self.index[mat.name]
 
 
@@ -748,7 +867,7 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
 
     Header (JSON, klein):
       {"format": "skptool-dump-bin", "version": 1, "unit": "m", "bin": <Dateiname>,
-       "materials": [{"name", "rgba", "alpha", "image"}],
+       "materials": [{"name", "rgba", "alpha", "image", optional "colorize": {"type", "rgb"}}],
        "definitions": [{"name", "offset", "nverts", "npolys", "nloops", "nuv", "uses"}],
        "instances": [{"name", "definition": Index oder -1 (reiner Container), "parent": Index
                       in "instances" oder -1, "matrix": 16 floats zeilenweise, Meter, relativ
@@ -877,6 +996,10 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
     if flatten:
         for inst in instances:
             inst["matrix"] = [float(v) for row in Matrix.Identity(4) for v in row]
+    # Unbenutzte SketchUp-Materialien (fix_up_skp_import, Fake-User) gehoeren weiter zum Modell
+    for mat in bpy.data.materials:
+        if mat.get("skp_unused") and mat.use_fake_user:
+            mt.id(mat)
     header = {"format": DUMP_FORMAT, "version": DUMP_VERSION, "unit": "m",
               "bin": os.path.basename(bin_path), "materials": mt.mats,
               "definitions": defs, "instances": instances,

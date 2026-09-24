@@ -7,6 +7,7 @@ import base64
 import importlib.util
 import io
 import json
+import math
 import os
 import shutil
 import struct
@@ -235,6 +236,48 @@ class TestOverwrite(Tmp):
         code, _, err = run_cli("convert", str(self.tmp / "d1" / "*.skp"), "-f", "glb", "-d",
                                str(self.tmp / "out"), "-q", "--force")
         self.assertEqual(code, 0, err)
+
+
+# ---------------------------------------------------------------- Werte aus der Datei
+
+class TestFeindlicheWerte(Tmp):
+    def test_absurd_tile_sizes_fall_back_to_one_inch(self):
+        """Seit OpenSKP 1.3.0 uebernimmt rewrite_legacy die Kachelgroesse der Quelle, und add_face
+        multipliziert jede Texturkoordinate damit. NaN, unendlich, 0 oder negative Werte aus einer
+        praeparierten Datei duerfen keine kaputte Texturmatrix erzeugen."""
+        for bad in (float("nan"), float("inf"), -5.0, 0.0, 1e300, "x", None):
+            with self.subTest(bad=bad):
+                self.assertEqual(core._tile_size(bad), 1.0)
+        self.assertEqual(core._tile_size(39.37), 39.37)
+        from PIL import Image
+
+        png = self.tmp / "t.png"
+        Image.new("RGB", (4, 4), (10, 20, 30)).save(png)
+        b = core.create()
+        mat = b.add_texture_material("Holz", str(png), applied_width=20.0, applied_height=10.0)
+        b.add_face([(0, 0, 0), (40, 0, 0), (40, 30, 0), (0, 30, 0)], material=mat,
+                   front_uv=[((0, 0, 0), (0.0, 0.0)), ((40, 0, 0), (2.0, 0.0)), ((0, 30, 0), (0.0, 3.0))])
+        src, out = self.tmp / "q.skp", self.tmp / "z.skp"
+        core.save_atomic(b, src)
+        echt = core.model_of
+
+        def boese(skp):
+            m = echt(skp)
+            for mt in m.materials:
+                if mt.texture is not None:
+                    mt.texture.width, mt.texture.height = float("inf"), float("nan")
+            return m
+
+        with mock.patch.object(core, "model_of", boese):
+            stats = core.rewrite_legacy(src, out)
+        self.assertEqual(stats["skipped"], 0)
+        # OpenSKPs Wiedergabe rechnet mit der kaputten Groesse NaN-Texturpunkte aus: die Flaeche
+        # bleibt, ihre Texturlage faellt weg, statt als NaN-Matrix in der Datei zu landen
+        self.assertEqual(stats.get("uv_dropped"), 1)
+        m = core.SkpFile.open(str(out)).parse()
+        self.assertEqual([(mt.texture.width, mt.texture.height) for mt in m.materials if mt.texture], [(1.0, 1.0)])
+        f = next(iter(m.root.faces.values()))
+        self.assertTrue(all(math.isfinite(v) for v in f.uv_transform or ()), f.uv_transform)
 
 
 # ---------------------------------------------------------------- mit Blender

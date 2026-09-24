@@ -17,43 +17,45 @@ from openskp import edit as _edit
 from openskp.create import ComponentDefinitionBuilder, SkpBuilder, SkpWriteError
 from openskp.export import dxf, ifc, json_export, obj, ply, stl
 
-# Texturausrichtung: OpenSKP 1.2.0 legt beim Schreiben die Texturachsen an die erste Kante der
-# Flaeche, beim Lesen leitet es sie allein aus der Flaechennormale ab. SketchUp selbst rechnet wie
-# der Leser: in ergebnisse/texturtest.skp war die in der Ebene gedrehte Flaeche 3 in SketchUp
-# genau so verzerrt wie beim Wiedereinlesen (Pruefung durch den Nutzer, 2026-09-22). Deshalb
-# bekommt der Writer die Basis des Lesers.
+# Texturausrichtung: SketchUp leitet die Texturachsen einer Flaeche allein aus ihrer Normale ab
+# (openskp._face_groups.face_uv_basis, vom Leser benutzt). OpenSKP 1.2.0 nahm beim Schreiben
+# stattdessen die erste Kante, skptool ersetzte das durch die Basis des Lesers. Seit 1.3.0 rechnet
+# der Writer selbst mit face_uv_basis, der Ersatz entfaellt; der Import bricht ab, falls sich das
+# wieder aendert (tests/test_openskp_vertrag.py weist zusaetzlich nach, dass OpenSKPs eigene
+# Matrix gedrehte, schraege und nach unten zeigende Flaechen richtig legt).
+# Geblieben ist die perspektivische Texturmatrix ab 4 Punktpaaren, die OpenSKP nicht kennt.
 import importlib as _importlib
 
 from openskp._face_groups import face_uv_basis as _sketchup_face_uv_basis
 
+OPENSKP_GETESTET = "1.3.0"
 # Achtung: "from openskp import create" liefert die Funktion create(), nicht das Modul.
 _openskp_create_module = _importlib.import_module("openskp.create")
 # Ersetzt wird nur, was es gibt: ein fehlender Name wuerde sonst still neu angelegt und nie
-# aufgerufen, die Texturen laegen dann ohne Fehlermeldung schief.
-# tests/test_openskp_vertrag.py prueft zusaetzlich, dass die Ersetzungen wirklich greifen.
-for _name in ("_face_uv_basis", "_uv_matrix_for_face", "_solve_uv_matrix"):
+# aufgerufen, verzerrte Texturen fielen dann ohne Fehlermeldung weg.
+# tests/test_openskp_vertrag.py prueft zusaetzlich, dass die Ersetzung wirklich greift.
+for _name in ("_uv_matrix_for_face", "_solve_uv_matrix"):
     if not callable(getattr(_openskp_create_module, _name, None)):
         raise ImportError(f"OpenSKP-Version passt nicht zu skptool: openskp.create.{_name} fehlt. "
-                          "Getestet mit 1.2.0.")
-
-
-def _uv_basis_like_sketchup(points, normal):
-    return _sketchup_face_uv_basis(normal)
-
-
-_openskp_create_module._face_uv_basis = _uv_basis_like_sketchup
+                          f"Getestet mit {OPENSKP_GETESTET}.")
+if getattr(_openskp_create_module, "face_uv_basis", None) is not _sketchup_face_uv_basis:
+    raise ImportError("OpenSKP-Version passt nicht zu skptool: der Writer (openskp.create) rechnet die "
+                      "Texturachsen nicht mehr mit face_uv_basis des Lesers. "
+                      f"Getestet mit {OPENSKP_GETESTET}.")
 
 
 def _uv_matrix_for_face(points, pairs, normal):
     """Texturmatrix wie SketchUp sie speichert: (u, v, 1) @ M = (x, y, 1) in der Flaechenbasis.
 
-    3 Punktpaare: affin (wie OpenSKP). Ab 4 Paaren: perspektivisch (SketchUps "fixierte Pins",
-    verzerrte Texturen). Dafuer wird die Homographie H mit (x, y, 1) @ H ~ (u, v, 1) aus allen
-    Paaren geschaetzt (DLT) und M = H^-1 gespeichert, genau die Umkehrung dessen, was der Leser
-    und SketchUp beim Anzeigen rechnen."""
+    3 Punktpaare: affin, genau wie OpenSKP. Ab 4 Paaren: perspektivisch (SketchUps "fixierte
+    Pins", verzerrte Texturen). Dafuer wird die Homographie H mit (x, y, 1) @ H ~ (u, v, 1) aus
+    allen Paaren geschaetzt (DLT) und M = H^-1 gespeichert, genau die Umkehrung dessen, was der
+    Leser und SketchUp beim Anzeigen rechnen. points bleibt fuer die Aufrufstelle in OpenSKP.
+    Die Paare kommen seit OpenSKP 1.3.0 schon mit der Kachelgroesse des Materials skaliert an
+    (create._scale_pins in add_face), hier ist nichts weiter zu tun."""
     if len(pairs) == 3:
-        return _openskp_create_module._solve_uv_matrix(pairs, _uv_basis_like_sketchup(points, normal))
-    xr, yr = _uv_basis_like_sketchup(points, normal)
+        return _openskp_create_module._solve_uv_matrix(pairs, _sketchup_face_uv_basis(normal))
+    xr, yr = _sketchup_face_uv_basis(normal)
     rows = []
     for p, (u, v) in pairs:
         x = p[0] * xr[0] + p[1] * xr[1] + p[2] * xr[2]
@@ -76,16 +78,19 @@ def _uv_matrix_for_face(points, pairs, normal):
 
 _openskp_create_module._uv_matrix_for_face = _uv_matrix_for_face
 
-# Flaechen in Dreiecke zerlegen (Szene, GLB fuer Blender, diff): OpenSKP 1.2.0 trianguliert Vierecke
-# stur ueber die Ecken 0-2 und groessere Flaechen per Delaunay ueber die Eckpunkte, behalten wird,
-# was mit dem Schwerpunkt innen liegt. Bei konkaven Flaechen fehlen so Teile oder ragen hinaus (Gondel:
-# eine Wand verlor 10 % ihrer Flaeche), und ein Zwischenpunkt auf einer Kante ergibt ein Dreieck ohne
-# Flaeche, das der SKP-Writer verwirft. Hier: eingeschraenkte Delaunay-Triangulierung, die die Kanten
-# einhaelt, in der Projektion und mit dem Umlaufsinn von OpenSKP. Einfache Faelle bleiben bei OpenSKP.
+# Flaechen in Dreiecke zerlegen (Szene, GLB fuer Blender, diff): OpenSKP trianguliert Vierecke stur
+# ueber die Ecken 0-2 (auch 1.3.0), groessere Flaechen in 1.2.0 per Delaunay ueber die Eckpunkte (bei
+# konkaven Flaechen fehlten Teile: eine Wand der Gondel verlor 10 % ihrer Flaeche), seit 1.3.0 per
+# earcut. Beides legt bei Zwischenpunkten auf einer Kante Dreiecke ohne Flaeche an, die der SKP-Writer
+# verwirft, und konkave Vierecke falsch. Gemessen mit 1.3.0 ueber alle Flaechen: gondel_2020 45 Dreiecke
+# ohne Flaeche (hier 0), gross_2026 447 ohne Flaeche, 55 mit falschem Umlauf, 434 Flaechen falsch
+# abgedeckt (hier 0, 4, 380 mit 1/50 des Flaechenfehlers). Deshalb bleibt der Ersatz: eingeschraenkte
+# Delaunay-Triangulierung, die die Kanten einhaelt, in der Projektion und mit dem Umlaufsinn von
+# OpenSKP. Einfache Faelle (Dreiecke, klar konvexe Vierecke) bleiben bei OpenSKP.
 _openskp_core_module = _importlib.import_module("openskp._core")
 if not callable(getattr(_openskp_core_module, "triangulate_face_3d", None)):
     raise ImportError("OpenSKP-Version passt nicht zu skptool: openskp._core.triangulate_face_3d fehlt. "
-                      "Getestet mit 1.2.0.")
+                      f"Getestet mit {OPENSKP_GETESTET}.")
 _triangulate_face_openskp = _openskp_core_module.triangulate_face_3d
 
 
@@ -149,6 +154,186 @@ def _constrained_face_triangles(vertices_3d, loops, normal):
 
 _openskp_core_module.triangulate_face_3d = _triangulate_face_3d
 
+# Materialnamen je Flaeche: OpenSKP fasst die Flaechen einer Definition nach dem Aussehen zusammen
+# (Farbe, doppelseitig, Textur, Deckkraft), nicht nach dem Material. Zwei Materialien gleicher
+# Farbe landen so in EINEM Primitiv mit EINEM glTF-Material, der Name war nur noch ueber die Farbe
+# zu raten (Gondel: "mat1" auf 114 Flaechen kam als "*5" zurueck, beide weiss). Hier bekommt die
+# aufgeloeste Farbe den Materialnamen mit: ein Tupel wie bisher (r, g, b), gleich nur bei gleicher
+# Farbe UND gleichem Material. Damit trennen Gruppierung und glTF-Materialliste von OpenSKP die
+# Materialien von selbst, ohne dass an Instanzen oder Geometrie etwas anders wird.
+# Zusaetzlich traegt die Farbe der Rueckseite einer zweiseitig verschieden bemalten Flaeche das
+# Kennzeichen "Rueckseite": Vorder- und Rueckseiten liegen dann in getrennten Primitiven, die
+# Vorderseiten zuerst. Blender behaelt von zwei deckungsgleichen Seiten die zuerst stehende
+# (bridge._backface_duplicates), so bleibt die Vorderseite vorne. Vorher entschied die zufaellige
+# Reihenfolge der Gruppen, und mit den neuen Namensgruppen drehten sich in gross_2026 rund 2000
+# Flaechen um. Gleiche glTF-Materialien fasst build_instanced_scene danach wieder zusammen.
+# build_instanced_scene (unten) merkt sich je Netz die Namen seiner Primitive in Reihenfolge.
+_openskp_face_groups_module = _importlib.import_module("openskp._face_groups")
+_openskp_instanced_module = _importlib.import_module("openskp.instanced_scene")
+for _mod, _name in ((_openskp_face_groups_module, "resolve_color"),
+                    (_openskp_face_groups_module, "_add_face_side"),
+                    (_openskp_instanced_module, "build_local_face_groups"),
+                    (_openskp_instanced_module, "build_instanced_scene")):
+    if not callable(getattr(_mod, _name, None)):
+        raise ImportError(f"OpenSKP-Version passt nicht zu skptool: {_mod.__name__}.{_name} fehlt. "
+                          f"Getestet mit {OPENSKP_GETESTET}.")
+
+
+class _NamedColor(tuple):
+    """(r, g, b) mit Materialname und Seite. Vergleich und Hash schliessen beides ein."""
+
+    def __new__(cls, rgb, material, back=False):
+        self = super().__new__(cls, rgb)
+        self.material = material
+        self.back = back
+        self._hash = hash((tuple(rgb), material, back))
+        return self
+
+    def __hash__(self):
+        return self._hash
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        return (tuple.__eq__(self, other) is True and getattr(other, "material", None) == self.material
+                and getattr(other, "back", False) == self.back)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __reduce__(self):
+        return (_NamedColor, (tuple(self), self.material, self.back))
+
+
+_resolve_color_openskp = _openskp_face_groups_module.resolve_color
+_add_face_side_openskp = _openskp_face_groups_module._add_face_side
+_named_colors: dict = {}
+
+
+def _named_color(rgb, material, back=False):
+    key = (tuple(rgb), material, back)
+    color = _named_colors.get(key)
+    if color is None:
+        if len(_named_colors) > 100_000:  # viele Dateien in einem Prozess: nicht endlos wachsen
+            _named_colors.clear()
+        color = _named_colors[key] = _NamedColor(key[0], material, back)
+    return color
+
+
+def _resolve_color_named(mat):
+    rgb = _resolve_color_openskp(mat)
+    return None if rgb is None else _named_color(rgb, mat.get("name"))
+
+
+def _add_face_side_sided(face_groups, builder, triangles, fn, color, double_sided, reverse, *rest):
+    if reverse:  # Rueckseite: eigene Gruppe (auch unbemalt, dann ohne Namen)
+        color = _named_color(color, getattr(color, "material", None), True)
+    return _add_face_side_openskp(face_groups, builder, triangles, fn, color, double_sided, reverse, *rest)
+
+
+_openskp_face_groups_module.resolve_color = _resolve_color_named
+_openskp_face_groups_module._add_face_side = _add_face_side_sided
+
+# Deckkraft: OpenSKP multipliziert die Deckkraft eines Materials mit dem Alpha seiner Farbe. Bei
+# Texturen ist dieses Alpha aber nur der Platzhalter der Durchschnittsfarbe, den der 2017-Writer (und
+# set_texture_average_color) mit 254 schreibt, weil 255 dort "eingefaerbt" heisst. Jede so
+# geschriebene Textur wurde in der GLB halbdurchsichtig (alphaMode BLEND, 0.996), Blender sortierte
+# sie wie Glas, und ueber Blender kam sie mit Deckkraft 0.996 zurueck; durchsichtiges Glas mit
+# Textur wurde aus 0.5 zu 0.498. Bei Texturen zaehlt deshalb nur die eigentliche Deckkraft, das
+# Alpha 254 des Platzhalters wird wie 255 behandelt. Uebrig bleibende Werte ab 254/255 gelten als
+# deckend (eine Farbe mit Alpha 254 ist nicht sichtbar durchsichtig, BLEND schadet nur).
+if not callable(getattr(_openskp_face_groups_module, "resolve_transparency", None)):
+    raise ImportError("OpenSKP-Version passt nicht zu skptool: openskp._face_groups.resolve_transparency "
+                      f"fehlt. Getestet mit {OPENSKP_GETESTET}.")
+_resolve_transparency_openskp = _openskp_face_groups_module.resolve_transparency
+
+
+def _resolve_transparency_deckend(mat):
+    if mat and mat.get("texture") and (mat.get("color") or {}).get("a") == 254:
+        mat = {**mat, "color": {**mat["color"], "a": 255}}
+    t = _resolve_transparency_openskp(mat)
+    return 1.0 if t >= 254 / 255 else t
+
+
+_openskp_face_groups_module.resolve_transparency = _resolve_transparency_deckend
+
+import threading as _threading  # noqa: E402
+
+_build_groups_openskp = _openskp_instanced_module.build_local_face_groups
+_recording = _threading.local()
+
+
+def _build_groups_recording(builder, ctx):
+    groups = _build_groups_openskp(builder, ctx)
+    if any(getattr(key[0], "back", False) for key in groups):  # Vorderseiten zuerst (stabil)
+        groups = dict(sorted(groups.items(), key=lambda kv: bool(getattr(kv[0][0], "back", False))))
+    names = getattr(_recording, "names", None)
+    if names is not None:  # gleiche Auswahl und Reihenfolge wie die Primitive in build_instanced_scene
+        names.append([getattr(key[0], "material", None) for key, g in groups.items() if g["local_faces"]])
+    return groups
+
+
+_openskp_instanced_module.build_local_face_groups = _build_groups_recording
+
+
+def _names_per_gltf_material(isc, recorded):
+    """SketchUp-Materialname je glTF-Material (None = unbemalt, Farbe geerbt) oder None, wenn die
+    Aufzeichnung nicht zur Szene passt (dann raet gltf_writer wie frueher ueber die Farbe)."""
+    calls = [names for names in recorded if names]  # leere Aufrufe ergeben kein Netz
+    if len(calls) != len(isc.mesh_resources):
+        return None
+    out: list = [None] * len(isc.gltf_materials)
+    seen = [False] * len(isc.gltf_materials)
+    for res, names in zip(isc.mesh_resources, calls):
+        if len(names) != len(res.primitives):
+            return None
+        for prim, name in zip(res.primitives, names):
+            i = int(prim.material_index)
+            if not 0 <= i < len(out) or (seen[i] and out[i] != name):
+                return None
+            out[i], seen[i] = name, True
+    return out
+
+
+def _merge_equal_materials(isc, names):
+    """Gleiche glTF-Materialien mit gleichem SketchUp-Namen (Vorder- und Rueckseitengruppe) zu
+    einem zusammenfassen, die Primitive zeigen dann auf dieses."""
+    index: dict = {}
+    remap, merged, merged_names = [], [], []
+    for i, gm in enumerate(isc.gltf_materials):
+        key = (json.dumps(gm, sort_keys=True), names[i])
+        if key not in index:
+            index[key] = len(merged)
+            merged.append(gm)
+            merged_names.append(names[i])
+        remap.append(index[key])
+    for res in isc.mesh_resources:
+        for prim in res.primitives:
+            prim.material_index = remap[int(prim.material_index)]
+    isc.gltf_materials = merged
+    return merged_names
+
+
+def build_instanced_scene(skp):
+    """openskp.instanced_scene.build_instanced_scene aus dem schon geparsten Ergebnis, dazu
+    isc.skp_material_names: SketchUp-Materialname je glTF-Material (None = unbemalte Flaeche).
+
+    name_override_keys=(): OpenSKP 1.3.0 wuerde Instanzen sonst nach Eintraegen "name", "label"
+    oder "code" beliebiger Attribut-Woerterbuecher benennen; skptool bleibt bei den Namen aus
+    SketchUp selbst (Instanz, sonst Definition). Die Knotennamen bilden zusammen mit der Position
+    den Schluessel fuer _instance_info (Ebene, Bemalung) und muessen dazu passen."""
+    if skp._parsed is None:
+        model_of(skp)
+    _recording.names = recorded = []
+    try:
+        isc = _openskp_instanced_module.build_instanced_scene(skp._parsed, name_override_keys=())
+    finally:
+        _recording.names = None
+    names = _names_per_gltf_material(isc, recorded)
+    isc.skp_material_names = _merge_equal_materials(isc, names) if names is not None else None
+    return isc
+
+
 INCH = 0.0254  # SketchUp speichert intern in Zoll
 NATIVE_FORMATS = {".glb", ".obj", ".stl", ".ply", ".dxf", ".ifc", ".json", ".3mf"}
 BLENDER_OUT_FORMATS = {".blend", ".fbx", ".usd", ".usda", ".usdc", ".usdz", ".abc", ".gltf", ".png"}
@@ -157,8 +342,12 @@ BLENDER_IN_FORMATS = {".blend", ".glb", ".gltf", ".fbx", ".obj", ".stl", ".ply",
 
 
 def header_version(path: str | Path) -> str:
-    """Liest die Versionskennung direkt aus dem Dateikopf, auch wenn das Parsen scheitert."""
-    head = Path(path).read_bytes()[:200]
+    """Liest die Versionskennung direkt aus dem Dateikopf, auch wenn das Parsen scheitert.
+
+    Nur die ersten 200 Byte werden gelesen, nie die ganze Datei: eine praeparierte Riesendatei
+    (mehrere GB) darf beim blossen "info" den Speicher nicht sprengen."""
+    with open(path, "rb") as fh:
+        head = fh.read(200)
     if "SketchUp".encode("utf-16-le") not in head:
         raise ValueError(f"{path} ist keine SketchUp-Datei")
     text = head.decode("utf-16-le", errors="ignore")
@@ -195,6 +384,11 @@ def check_container(path: str | Path) -> None:
             infos = z.infolist()
     except zipfile.BadZipFile:
         return  # Format vor 2021, kein ZIP
+    except NotImplementedError as exc:
+        # zipfile wirft das bei nicht unterstuetzten ZIP-Versionen oder Kompressionsarten (z. B. wenn
+        # ein Feld im lokalen Kopf verdreht ist). Eine echte .skp braucht so etwas nie: klar ablehnen,
+        # statt den Fehler als Traceback nach aussen dringen zu lassen.
+        raise UnsafeFileError(f"{path}: Container laesst sich nicht lesen ({exc})") from None
     if len(infos) > MAX_ZIP_ENTRIES:
         raise UnsafeFileError(f"{path}: {len(infos)} Eintraege im Container (Grenze {MAX_ZIP_ENTRIES})")
     total = sum(i.file_size for i in infos)
@@ -223,18 +417,24 @@ def model_of(skp: SkpFile):
     return model
 
 
-def build_scene(skp: SkpFile):
+def build_scene(skp: SkpFile, curves: bool = False):
     """Szene aus dem bereits geparsten Ergebnis bauen.
 
     SkpFile.build_scene() liest die Datei absichtlich ein zweites Mal komplett ein, was bei
     grossen Dateien die Laufzeit fast verdoppelt. parse() speichert das Rohergebnis bereits,
     und der Szenenaufbau veraendert es nicht; glb.export nutzt denselben Weg.
+
+    curves: lose Kanten als Linienzuege (Scene.curve_sets, seit OpenSKP 1.3.0). Nur der
+    IFC-Export liest sie, alle anderen Wege sparen sich die Arbeit.
+    name_override_keys=(): OpenSKP 1.3.0 wuerde Instanzen sonst nach Eintraegen "name", "label"
+    oder "code" beliebiger Attribut-Woerterbuecher benennen; skptool bleibt bei den Namen aus
+    SketchUp selbst (Instanz, sonst Definition), wie in build_instanced_scene().
     """
     from openskp import scene as _scene
 
     if skp._parsed is None:
         model_of(skp)
-    return _scene.build_scene(skp._parsed)
+    return _scene.build_scene(skp._parsed, name_override_keys=(), include_curve_sets=curves)
 
 
 # ---------------------------------------------------------------- info
@@ -293,23 +493,20 @@ def export_native(skp: SkpFile, out: Path, textures: bool = True) -> Path:
     ext = out.suffix.lower()
     out.parent.mkdir(parents=True, exist_ok=True)
     if ext == ".glb":  # instanzerhaltend, eindeutige Geometrie nur einmal
-        from openskp import instanced_scene
-
         from skptool.gltf_writer import write_instanced_glb
 
         m = model_of(skp)
-        write_instanced_glb(m, instanced_scene.build_instanced_scene(skp._parsed), _instance_info(m), out,
-                            textures=textures)
+        write_instanced_glb(m, build_instanced_scene(skp), _instance_info(m), out, textures=textures,
+                            bake_colorize=True)
         return out
     if ext == ".3mf":  # 3D-Druck: Millimeter, Z oben, eindeutige Netze einmal, Hinweise auf stderr
-        from openskp import instanced_scene
-
         from skptool.export_3mf import write_3mf
 
-        write_3mf(model_of(skp), instanced_scene.build_instanced_scene(skp._parsed), out,
-                  max_components=MAX_PLACEMENTS)
+        write_3mf(model_of(skp), build_instanced_scene(skp), out, max_components=MAX_PLACEMENTS)
         return out
-    scene = build_scene(skp)
+    # IFC: seit OpenSKP 1.3.0 in Millimetern und Z oben (vorher Zoll-Werte unter der Einheit mm
+    # und Y oben), lose Kanten kommen als IfcAnnotation mit
+    scene = build_scene(skp, curves=ext == ".ifc")
     if ext == ".obj":
         obj.export(scene, out)
     elif ext == ".stl":
@@ -370,12 +567,10 @@ def export_for_blender(skp: SkpFile, glb_path: Path, meta_path: Path, textures: 
     Jede eindeutige Geometrie steht nur einmal in der Datei, Blender macht daraus verknuepfte
     Kopien. Ebene, geerbte Bemalung und Komponentenname haengen als extras an jedem Knoten.
     """
-    from openskp import instanced_scene
-
     from skptool.gltf_writer import write_instanced_glb
 
     m = model_of(skp)
-    isc = instanced_scene.build_instanced_scene(skp._parsed)
+    isc = build_instanced_scene(skp)
     stats = write_instanced_glb(m, isc, _instance_info(m), glb_path, textures=textures)
     hard = stats.pop("hard_edges", {})
     meta = {
@@ -431,8 +626,9 @@ def triangulate_polygon(points, holes=()):
 
     Projiziert auf die Best-Fit-Ebene und nutzt die eingeschraenkte Delaunay-Triangulierung
     von Shapely, damit auch konkave Flaechen und Loecher korrekt bleiben. Die Dreiecke
-    verwenden die Original-3D-Punkte. Ersetzt auto_triangulate des OpenSKP-Writers, dessen
-    Ausgabe in Version 1.2.0 nicht wieder lesbar ist.
+    verwenden die Original-3D-Punkte. Ersetzt auto_triangulate des OpenSKP-Writers: das faechert
+    (auch in 1.3.0) nur vom ersten Punkt aus auf, was konkave Flaechen falsch zerlegt, und kann
+    weder Loecher noch Texturpunkte. (Mit 1.2.0 war seine Ausgabe zudem teils nicht wieder lesbar.)
     """
     import shapely
     from shapely.geometry import Polygon
@@ -508,7 +704,14 @@ def add_face_safe(orig, target, points, stats, *args, uv_lookup=None, **kwargs):
 
     Texturausrichtung bleibt dabei erhalten: jedes Dreieck bekommt eigene Texturpunkte, aus
     uv_lookup (echte UV je Eckpunkt) oder aus den Texturpunkten der ganzen Flaeche errechnet.
+    Texturpunkte mit NaN oder unendlich (etwa aus einer praeparierten Kachelgroesse der Quelle)
+    fallen weg: der OpenSKP-Writer wuerde daraus still eine NaN-Texturmatrix schreiben.
     """
+    for key in ("front_uv", "back_uv"):
+        pins = kwargs.get(key)
+        if pins is not None and not all(math.isfinite(float(c)) for p, t in pins for c in (*p, *t)):
+            kwargs.pop(key)
+            stats["uv_dropped"] = stats.get("uv_dropped", 0) + 1
     try:
         return orig(target, points, *args, **kwargs)
     except SkpWriteError as exc:
@@ -590,6 +793,31 @@ def set_texture_average_color(builder, rgb) -> None:
         buf[i:i + len(_AVG_PLACEHOLDER)] = bytes([r, g, b, 254, 0, r, g, b, 254])
 
 
+_COLORIZE_TAIL = b"\xff\xfe\xff\x00" + bytes([1, 0, 0, 0, 0, 0, 0, 0])  # leerer Name, Block (1, 0)
+
+
+def set_texture_colorize(builder, rgb) -> bool:
+    """Das zuletzt geschriebene Texturmaterial als eingefaerbt (SketchUp "Colorize") markieren.
+
+    Im Format bis 2020 speichert SketchUp bei einer getoenten Textur das Originalbild, als
+    "Durchschnittsfarbe" die Zielfarbe mit Alpha 255 und im Block danach eine 1 im zweiten u32
+    (so liest es openskp.legacy._texture_block: eines der beiden Zeichen genuegt). OpenSKPs Writer
+    kennt kein Colorize und schreibt Weiss mit Alpha 254 und (1, 0); hier werden beide Zeichen gesetzt.
+    Die Art der Toenung (verschieben oder einfaerben) hat in diesem Datensatz kein bekanntes Feld,
+    OpenSKP liest solche Materialien immer als "einfaerben". Rueckgabe False, wenn der Datensatz
+    nicht wie erwartet aussieht (dann bleibt er unveraendert)."""
+    buf = builder._material_writer.buf
+    i = buf.rfind(_AVG_PLACEHOLDER)
+    tail = i + len(_AVG_PLACEHOLDER)
+    if i < 0 or not rgb or bytes(buf[tail:tail + len(_COLORIZE_TAIL)]) != _COLORIZE_TAIL:
+        return False
+    r, g, b = (max(0, min(255, int(c))) for c in rgb[:3])
+    buf[i:tail] = bytes([r, g, b, 255, 0, r, g, b, 255])
+    flag = tail + 4 + 4  # nach dem leeren Namen und dem ersten u32
+    buf[flag:flag + 4] = (1).to_bytes(4, "little")
+    return True
+
+
 AVERAGE_MAX_PIXELS = 64 * 1024 * 1024  # groesser: Durchschnittsfarbe auslassen statt GBs zu dekodieren
 
 
@@ -608,6 +836,16 @@ def image_average_rgb(path):
         return None
 
 
+def _tile_size(value) -> float:
+    """Kachelgroesse aus der Quelldatei (Zoll) oder 1.0. Die Datei gilt als feindlich: NaN,
+    unendlich, 0, negativ oder absurd gross (ueber 1000 km) wuerde jede Texturmatrix verderben."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return v if math.isfinite(v) and 1e-9 < v <= MAX_INCHES else 1.0
+
+
 def _replay_materials(builder, model, warnings):
     """Wie openskp.edit._replay_materials, aber mit Deckkraft (Glas bleibt durchsichtig)."""
     import os
@@ -622,12 +860,22 @@ def _replay_materials(builder, model, warnings):
             try:
                 with os.fdopen(fd, "wb") as fh:
                     fh.write(mat.texture.data)
-                slot = builder.add_texture_material(mat.name, tmp_path, applied_height=1.0, opacity=opacity)
-                set_texture_average_color(builder, mat.color or image_average_rgb(tmp_path))
+                # Echte Kachelgroesse wie in der Quelle (Materialbrowser, in SketchUp neu bemalte
+                # Flaechen). Seit OpenSKP 1.3.0 skaliert add_face die Texturpunkte (in Kacheln)
+                # selbst mit dieser Groesse, die Lage jeder Flaeche bleibt gleich. Mit 1.2.0 musste
+                # hier 1 Zoll je Kachel stehen, sonst waere doppelt geteilt worden.
+                slot = builder.add_texture_material(mat.name, tmp_path,
+                                                    applied_width=_tile_size(mat.texture.width),
+                                                    applied_height=_tile_size(mat.texture.height),
+                                                    opacity=opacity)
+                if mat.colorized:  # Originalbild plus Zielfarbe, wie SketchUp es speichert
+                    if not set_texture_colorize(builder, mat.color):
+                        warnings.append(f"Material {mat.name!r}: Farbtoenung der Textur geht verloren")
+                        set_texture_average_color(builder, image_average_rgb(tmp_path))
+                else:
+                    set_texture_average_color(builder, mat.color or image_average_rgb(tmp_path))
             finally:
                 os.unlink(tmp_path)
-            if mat.colorized:
-                warnings.append(f"Material {mat.name!r}: Farbtoenung der Textur geht verloren")
         else:
             slot = builder.add_material(mat.name, mat.color, opacity=opacity)
         slots[id(mat)] = slot
@@ -685,32 +933,390 @@ class _SoftDiagonals:
         return self._target.add_face(points, **kwargs)
 
 
-def _replay_body(target, defn, model, material_slots, layer_slots, warnings, context, def_builders, stats):
-    """Wie edit._replay_body, aber mit den Kantenflags je Kante statt je Flaeche."""
+# ---------------------------------------------------------------- Anmerkungen und Attribute
+
+# Laengster Text, den der 2017-Writer schreiben kann: _ArchiveWriter._write_str kennt nur die
+# kurze MFC-Laenge (ein Byte, 0xFF ist das Escape) und bricht sonst MITTEN im Schreiben ab.
+# Alles Laengere wird vorher aussortiert, sonst waere der Puffer halb beschrieben.
+_STR_MAX = 254
+
+
+@dataclasses.dataclass
+class Anmerkungen:
+    """Texte und Bemassungen eines Modells, getrennt nach schreibbar und nicht schreibbar.
+
+    texte/masse: {Definitions-ID oder "ROOT": [...]} in den Koordinaten dieser Definition, so
+    wie sie der 2017-Writer schreiben kann. Die Zaehler nennen, was davon nicht geht."""
+    texte: dict
+    masse: dict
+    texte_gesamt: int = 0
+    texte_ohne_anker: int = 0
+    texte_zu_lang: int = 0
+    masse_gesamt: int = 0
+    masse_ohne_endpunkte: int = 0
+    masse_zu_lang: int = 0
+
+
+def _punkt(p):
+    try:
+        q = tuple(float(c) for c in p)
+    except (TypeError, ValueError):
+        return None
+    return q if len(q) == 3 and all(math.isfinite(c) for c in q) else None
+
+
+def _str_ok(s) -> bool:
+    return isinstance(s, str) and len(s.encode("utf-16-le")) // 2 <= _STR_MAX
+
+
+def anmerkungen(model, parsed=None) -> Anmerkungen:
+    """Welche Texte und Bemassungen der 2017-Writer uebernehmen kann (fuer rewrite_legacy und report).
+
+    Texte: OpenSKP liefert Ankerpunkt und Beschriftungspunkt nur fuer frei gesetzte Texte (in
+    Koordinaten ihrer Definition). An Geometrie verankerte Texte haben keinen Punkt.
+    Bemassungen: Das Modell behaelt je Definition nur Text und Sichtbarkeit, die Endpunkte stehen
+    bei Dateien vor 2021 nur im Rohergebnis des Parsers (parsed, SkpFile._parsed). Dateien ab 2021
+    fuehren alle Bemassungen nur auf Modellebene in Weltkoordinaten (model.dimensions)."""
+    a = Anmerkungen(texte={}, masse={})
+    raw_defs = (parsed or {}).get("defs_dict") or {}
+    defs = {**model.definitions, "ROOT": model.root}
+    for key, defn in defs.items():
+        for t in getattr(defn, "texts", None) or []:
+            a.texte_gesamt += 1
+            p = _punkt(getattr(t, "point", None))
+            if p is None:
+                a.texte_ohne_anker += 1
+                continue
+            text = getattr(t, "text", "") or ""
+            if not _str_ok(text):
+                a.texte_zu_lang += 1
+                continue
+            label = _punkt(getattr(t, "label_point", None)) or p
+            a.texte.setdefault(key, []).append((text, p, label, bool(getattr(t, "hidden", False))))
+        dims = getattr(defn, "dimensions", None) or []
+        raw = getattr((raw_defs.get(key) or {}).get("builder"), "dimensions", None) or []
+        for i, d in enumerate(dims):
+            r = raw[i] if i < len(raw) and isinstance(raw[i], dict) else {}
+            _mass_eintragen(a, key, r.get("a") or getattr(d, "a", None), r.get("b") or getattr(d, "b", None),
+                            r.get("offset", getattr(d, "offset", 0.0)), getattr(d, "text", "") or "",
+                            bool(getattr(d, "hidden", False)))
+    if not any(getattr(d, "dimensions", None) for d in defs.values()):
+        # Ab 2021: nur die Modellliste. Vor 2021 steht sie zusaetzlich in root.dimensions (doppelt).
+        for d in getattr(model, "dimensions", None) or []:
+            _mass_eintragen(a, "ROOT", getattr(d, "a", None), getattr(d, "b", None),
+                            getattr(d, "offset", 0.0), getattr(d, "text", "") or "",
+                            bool(getattr(d, "hidden", False)))
+    return a
+
+
+def _mass_eintragen(a: Anmerkungen, key, p, q, offset, text, hidden) -> None:
+    a.masse_gesamt += 1
+    p, q = _punkt(p), _punkt(q)
+    try:
+        offset = float(offset or 0.0)
+    except (TypeError, ValueError):
+        offset = 0.0
+    if p is None or q is None or p == q or not math.isfinite(offset):
+        a.masse_ohne_endpunkte += 1
+    elif not _str_ok(text):
+        a.masse_zu_lang += 1
+    else:
+        a.masse.setdefault(key, []).append((p, q, offset, text, hidden))
+
+
+def _writer_of(target):
+    """Der Archiv-Writer, in den target (Modell oder Definition) seine Objekte schreibt."""
+    if isinstance(target, SkpBuilder):
+        target._ensure_geometry_writer()
+        return target._geometry_writer
+    return target._skp._definition_writer
+
+
+def _counted(target) -> None:
+    target._new_entity_count += 1
+    if isinstance(target, SkpBuilder):
+        target._face_count += 1  # wie add_text: "mindestens ein Objekt im Modell"
+
+
+def _font(writer, builder) -> None:
+    """Eine Schrift je Datei, beim ersten Text oder Mass inline, danach als Rueckverweis.
+
+    Definitionen stehen in der Datei vor dem Modell, eine dort angelegte Schrift ist fuer alles
+    Spaetere (auch das Modell) ein gueltiger Rueckverweis. Die Nummern sind dateiweit."""
+    if builder._dim_font_slot is None:
+        builder._dim_font_slot = writer._new_of_known_class("CSkFont", schema=1)
+        writer.buf += _openskp_create_module._DIM_FONT_PAYLOAD
+    else:
+        writer._backref(builder._dim_font_slot)
+
+
+def write_text(target, builder, text: str, point, label, hidden: bool = False) -> None:
+    """Freier Text mit Fuehrungslinie in ein Modell ODER eine Definition schreiben.
+
+    Byte fuer Byte wie SkpBuilder.add_text (tests/test_openskp_vertrag.py vergleicht das), nur
+    mit echter Sichtbarkeit statt fester Zeichenbasis und auch in Definitionen. OpenSKP kann das
+    nur im Modell (add_text gibt es nur am SkpBuilder)."""
+    if not _str_ok(text):
+        raise SkpWriteError(f"Text zu lang (hoechstens {_STR_MAX} Zeichen)")
+    c = _openskp_create_module
+    w = _writer_of(target)
+    w._new_of_known_class("CText", schema=9)
+    w._preamble()
+    w._drawbase(hidden=hidden)
+    _font(w, builder)
+    w.buf += c._f64(0.0) + c._f64(0.0)  # Bildschirmanteil, bei freien Texten unbenutzt
+    w.buf += c._u32(1) + c._u32(4)  # freier Anker
+    w.buf += b"".join(c._f64(v) for v in point)
+    w.buf += bytes(12)
+    w.buf += b"".join(c._f64(v) for v in label)
+    w.buf += bytes(16)
+    w.buf += c._f64(1.0)
+    w.buf += c._u32(2)  # Fuehrungslinie: Stecknadel
+    w.buf += c._TEXT_DELIM
+    w._write_str(text)
+    w.buf += bytes(5)
+    _counted(target)
+
+
+def write_dimension(target, builder, p, q, offset: float = 10.0, text: str = "", hidden: bool = False) -> None:
+    """Freie lineare Bemassung in ein Modell ODER eine Definition schreiben.
+
+    Byte fuer Byte wie SkpBuilder.add_dimension (Vertragstest), zusaetzlich mit eigenem Text
+    ("" = gemessener Wert) und Sichtbarkeit. Die Ebene der Masslinie kennt der Writer nicht."""
+    p, q = _punkt(p), _punkt(q)
+    if p is None or q is None or p == q:
+        raise SkpWriteError("Bemassung braucht zwei verschiedene Endpunkte")
+    if not _str_ok(text):
+        raise SkpWriteError(f"Text zu lang (hoechstens {_STR_MAX} Zeichen)")
+    c = _openskp_create_module
+    w = _writer_of(target)
+    w._new_of_known_class("CDimensionLinear", schema=6)
+    w._preamble()
+    w._drawbase(hidden=hidden)
+    w._write_str(text)
+    _font(w, builder)
+    w.buf += bytes(5) + c._u32(1) + c._u32(4)  # Anschluss 1: freier Punkt, kein Objektverweis
+    w.buf += b"".join(c._f64(v) for v in p) + bytes(2)
+    w.buf += bytes(10) + c._u32(1) + c._u32(4)  # Anschluss 2
+    w.buf += b"".join(c._f64(v) for v in q) + bytes(2)
+    w.buf += bytes(2)
+    for val in (0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0):  # Vorgaben des SDK fuer freie Masse
+        w.buf += c._f64(val)
+    w.buf += c._u32(0)
+    w.buf += c._f64(float(offset)) + c._f64(0.0) + c._u32(1)
+    _counted(target)
+
+
+_ATTR_TIEFE = 32  # verschachtelte Felder: tiefer ist in keiner echten Datei zu erwarten
+
+
+def _attr_value(v, tiefe=0):
+    """Leserwert -> Writerwert. Rueckgabe (Wert, ok). OpenSKP liest Punkt und Vektor beide als
+    3-Tupel (Listen sind Felder), Zeitstempel als int, Wahrheitswerte vor 2021 als int."""
+    c = _openskp_create_module
+    if tiefe > _ATTR_TIEFE:  # feindliche Datei: Rekursion des Writers nicht bis ans Limit treiben
+        return None, False
+    if v is None or isinstance(v, (bool, float)):
+        return v, True
+    if isinstance(v, str):
+        return v, _str_ok(v)
+    if isinstance(v, int):
+        if -2**31 <= v < 2**31:
+            return v, True
+        if 0 <= v < 2**32:
+            return c.Timestamp(v), True
+        return float(v), True
+    if isinstance(v, tuple) and len(v) == 3 and all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                                                   for x in v):
+        return c.Point3d(*(float(x) for x in v)), True
+    if isinstance(v, (list, tuple)):
+        out = []
+        for x in v:
+            y, ok = _attr_value(x, tiefe + 1)
+            if not ok:
+                return None, False
+            out.append(y)
+        return out, True
+    return None, False
+
+
+def attribute_dicts(inst, stats=None) -> list:
+    """Alle Attribut-Woerterbuecher einer Platzierung so, wie der Writer sie annimmt.
+
+    Werte, die er nicht schreiben kann (Text ueber 254 Zeichen, unbekannter Typ), fallen einzeln
+    weg und werden in stats["attribute_lost"] gezaehlt, der Rest des Woerterbuchs bleibt."""
+    source = getattr(inst, "attribute_dictionaries", None) or {}
+    if not source and getattr(inst, "properties", None):  # aeltere Leser: nur dynamic_attributes als Text
+        source = {"dynamic_attributes": dict(inst.properties)}
+    out = []
+    lost = 0
+    for name, entries in source.items():
+        if not name or not _str_ok(name) or not isinstance(entries, dict):
+            lost += len(entries) if isinstance(entries, dict) else 1
+            continue
+        clean = {}
+        for key, value in entries.items():
+            v, ok = _attr_value(value)
+            if ok and key and _str_ok(key):
+                clean[key] = v
+            else:
+                lost += 1
+        out.append((name, clean))
+    if stats is not None:
+        stats["attribute_lost"] = stats.get("attribute_lost", 0) + lost
+        stats["attribute_dicts"] = stats.get("attribute_dicts", 0) + len(out)
+    return out
+
+
+def _replay_instance(target, inst, def_builders, material_slots, layer_slots, model, warnings, context, stats):
+    """Wie edit._replay_instance, aber mit allen Attribut-Woerterbuechern in ihren echten Typen.
+
+    edit uebertraegt nur "dynamic_attributes", und das als Text (Instance.properties)."""
+    def_builder = def_builders.get(inst.ref_idx)
+    if def_builder is None:
+        warnings.append(f"{context}: instance {inst.name!r} references unavailable definition - skipped")
+        return
+    matrix3x3 = tuple(inst.matrix[0:9]) if len(inst.matrix) >= 9 else None
+    translation = tuple(inst.matrix[9:12]) if len(inst.matrix) >= 12 else (0.0, 0.0, 0.0)
+    material = _edit._material_slot(inst.material_id, model, material_slots)
+    layer = layer_slots.get(inst.layer) if inst.layer else None
+    dicts = attribute_dicts(inst, stats)
+    try:
+        # name=inst.name wie in edit: ein leerer Name ist ein echter Name
+        target.add_instance(def_builder, name=inst.name, translation=translation, matrix3x3=matrix3x3,
+                            material=material, layer=layer, hidden=inst.hidden, attribute_dicts=dicts)
+    except SkpWriteError as exc:
+        warnings.append(f"{context}: instance {inst.name!r} skipped ({exc})")
+
+
+def _replay_notes(target, builder, notes, warnings, context, stats) -> None:
+    texte, masse = notes
+    for text, point, label, hidden in texte:
+        try:
+            write_text(target, builder, text, point, label, hidden)
+            stats["texts"] = stats.get("texts", 0) + 1
+        except SkpWriteError as exc:  # vorher geprueft, sollte nicht vorkommen
+            warnings.append(f"{context}: Text {text[:40]!r} nicht geschrieben ({exc})")
+            stats["texts_failed"] = stats.get("texts_failed", 0) + 1
+    for p, q, offset, text, hidden in masse:
+        try:
+            write_dimension(target, builder, p, q, offset, text, hidden)
+            stats["dimensions"] = stats.get("dimensions", 0) + 1
+        except SkpWriteError as exc:
+            warnings.append(f"{context}: Bemassung nicht geschrieben ({exc})")
+            stats["dimensions_failed"] = stats.get("dimensions_failed", 0) + 1
+
+
+def _replay_body(target, defn, model, material_slots, layer_slots, warnings, context, def_builders, stats,
+                 builder=None, notes=((), ())):
+    """Wie edit._replay_body, aber mit den Kantenflags je Kante statt je Flaeche, allen
+    Attributen der Platzierungen und den Texten und Bemassungen dieser Definition."""
     stats["edges"] = stats.get("edges", 0) + _predeclare_edges(target, defn)
     edges = _edit._edge_map(defn)
     faces = _SoftDiagonals(target)
     for face in defn.faces.values():
         _edit._replay_face(faces, face, defn, edges, model, material_slots, warnings, context)
     for inst in defn.instances:
-        _edit._replay_instance(target, inst, def_builders, material_slots, layer_slots, model, warnings, context)
+        _replay_instance(target, inst, def_builders, material_slots, layer_slots, model, warnings, context, stats)
+    if notes[0] or notes[1]:
+        _replay_notes(target, builder, notes, warnings, context, stats)
+
+
+def _mehrzahl(n: int, eins: str, viele: str) -> str:
+    return f"{n} {eins if n == 1 else viele}"
+
+
+def dynamic_instances(model) -> list[str]:
+    """Namen aller Platzierungen mit "dynamic_attributes" (SketchUps dynamische Komponenten)."""
+    return [inst.name or getattr(model.definitions.get(inst.ref_idx), "name", "") or "?"
+            for d in [model.root, *model.definitions.values()] for inst in d.instances
+            if "dynamic_attributes" in (getattr(inst, "attribute_dictionaries", None) or {})]
+
+
+def _namen(items, n=5) -> str:
+    items = list(items)
+    text = ", ".join(f'"{x}"' for x in items[:n])
+    return text + (f" und {len(items) - n} weitere" if len(items) > n else "")
+
+
+def verlust_zeilen(model, a: Anmerkungen, stats: dict | None = None) -> list[str]:
+    """Je Art, die beim Umschreiben ins 2017-Format verloren geht, eine deutsche Zeile mit Anzahl.
+
+    Ohne stats (skptool report) die Vorhersage aus dem gelesenen Modell, mit stats die Zahlen
+    des echten Laufs. Gleiche Saetze an beiden Stellen, damit Bericht und Umschreiben
+    zusammenpassen."""
+    if stats is None:  # Vorhersage: dieselbe Pruefung der Attribute wie beim Schreiben
+        stats = {}
+        for d in [model.root, *model.definitions.values()]:
+            for i in d.instances:
+                attribute_dicts(i, stats)
+    out = []
+    n = len(getattr(model, "pages", None) or [])
+    if n:
+        out.append(f"Szenen: {_mehrzahl(n, 'Szene geht', 'Szenen gehen')} verloren "
+                   "(der 2017-Writer kann keine Szenen schreiben)")
+    defs = [model.root, *model.definitions.values()]
+    n = sum(len(getattr(d, "section_planes", None) or []) for d in defs)
+    if n:
+        out.append(f"Schnittebenen: {_mehrzahl(n, 'Schnittebene geht', 'Schnittebenen gehen')} verloren "
+                   "(der 2017-Writer kann keine Schnittebenen schreiben)")
+    lost = a.texte_ohne_anker + a.texte_zu_lang + stats.get("texts_failed", 0)
+    if lost:
+        why = [w for k, w in ((a.texte_ohne_anker, f"{a.texte_ohne_anker} ohne freien Ankerpunkt"),
+                              (a.texte_zu_lang, f"{a.texte_zu_lang} laenger als {_STR_MAX} Zeichen"),
+                              (stats.get("texts_failed", 0), f"{stats.get('texts_failed', 0)} vom Writer abgelehnt"))
+               if k]
+        out.append(f"Texte: {lost} von {a.texte_gesamt} {'geht' if lost == 1 else 'gehen'} verloren "
+                   f"({', '.join(why)})")
+    lost = a.masse_ohne_endpunkte + a.masse_zu_lang + stats.get("dimensions_failed", 0)
+    if lost:
+        why = [w for k, w in ((a.masse_ohne_endpunkte, f"{a.masse_ohne_endpunkte} ohne lesbare Endpunkte"),
+                              (a.masse_zu_lang, f"{a.masse_zu_lang} mit Text ueber {_STR_MAX} Zeichen"),
+                              (stats.get("dimensions_failed", 0),
+                               f"{stats.get('dimensions_failed', 0)} vom Writer abgelehnt")) if k]
+        out.append(f"Bemassungen: {lost} von {a.masse_gesamt} {'geht' if lost == 1 else 'gehen'} verloren "
+                   f"({', '.join(why)})")
+    insts = [i for d in defs for i in d.instances]
+    dyn = dynamic_instances(model)
+    if dyn:
+        out.append(f"Dynamische Komponenten: {_mehrzahl(len(dyn), 'Platzierung behaelt', 'Platzierungen behalten')} "
+                   "ihre Attribute als Daten, die Formeln an der Definition liest OpenSKP nicht, "
+                   f"das dynamische Verhalten geht verloren: {_namen(dyn)}")
+    lost = stats.get("attribute_lost", 0)
+    if lost:
+        out.append(f"Attribute: {_mehrzahl(lost, 'Wert geht', 'Werte gehen')} verloren "
+                   f"(Text ueber {_STR_MAX} Zeichen oder unbekannter Typ)")
+    n = sum(1 for i in insts if getattr(model.definitions.get(i.ref_idx), "is_image", False))
+    if n:
+        out.append(f"Bilder: {_mehrzahl(n, 'Bild wird', 'Bilder werden')} als Komponente mit Bildtextur "
+                   "geschrieben, nicht als SketchUp-Bildobjekt")
+    return out
 
 
 def rewrite_legacy(src: Path, out: Path) -> dict:
     """Beliebige lesbare .skp (auch 2021+) als SketchUp-2017-Datei neu aufbauen.
 
     Nutzt die Daten-Wiedergabe aus openskp.edit (Materialien, Ebenen, Komponenten,
-    Gruppen, Instanzen), ohne deren Sperre fuer Dateien ab 2021. Es wird kein Code
-    aus der Datei erzeugt oder ausgefuehrt. openskp ist auf 1.2.0 gepinnt, weil hier
+    Gruppen, Instanzen), ohne deren Sperre fuer Dateien ab 2021. Dazu kommen freie Texte und
+    Bemassungen (in ihrer Definition), alle Attribut-Woerterbuecher der Platzierungen und je
+    verlorener Art eine Zeile in stats["verluste"] (auch in stats["warnings"]). Es wird kein Code
+    aus der Datei erzeugt oder ausgefuehrt. openskp ist auf 1.3.0 gepinnt, weil hier
     interne Funktionen genutzt werden.
     """
-    model = model_of(open_skp(src))
+    skp = open_skp(src)
+    model = model_of(skp)
+    notes = anmerkungen(model, skp._parsed)
+    skp._parsed = None  # Rohergebnis nur fuer die Endpunkte der Bemassungen, danach freigeben
     # Materialien ohne ID sind von keiner Flaeche referenzierbar (z. B. "Layer_Layer0" von
     # Render-Plugins). Mitkopiert wuerden sie echte IDs bekommen und Ebenenfarben imitieren.
     model = dataclasses.replace(model, materials=[mt for mt in model.materials if mt.id is not None])
     warnings: list[str] = []
-    stats = {"triangulated": 0, "skipped": 0}
+    stats = {"triangulated": 0, "skipped": 0, "texts": 0, "dimensions": 0}
     builder = create()
+
+    def notes_of(key):
+        return notes.texte.get(key, ()), notes.masse.get(key, ())
+
     with tolerant_faces(stats):
         material_slots = _replay_materials(builder, model, warnings)
         layer_slots = {
@@ -722,15 +1328,22 @@ def rewrite_legacy(src: Path, out: Path) -> dict:
         for def_id in _edit._definition_order(model):
             defn = model.definitions[def_id]
             context = f"definition {defn.name or def_id!r}"
-            if not (_edit._definition_has_content(defn, def_builders) or any(_edge_points(defn))):
+            if not (_edit._definition_has_content(defn, def_builders) or any(_edge_points(defn))
+                    or any(notes_of(def_id))):
                 warnings.append(f"{context}: uebersprungen (keine Geometrie)")
                 continue
-            with builder.add_component_definition(defn.name) as db:
+            # Verhalten "immer zur Kamera drehen" (2D-Personen, Baeume) und "Schatten zur
+            # Sonne": seit OpenSKP 1.3.0 schreibbar, wie in edit.open_existing
+            with builder.add_component_definition(
+                    defn.name, always_faces_camera=bool(getattr(defn, "always_faces_camera", False)),
+                    shadows_face_sun=bool(getattr(defn, "shadows_face_sun", False))) as db:
                 _replay_body(db, defn, model, material_slots, layer_slots, warnings, context,
-                             def_builders, stats)
+                             def_builders, stats, builder, notes_of(def_id))
             def_builders[def_id] = db
         _replay_body(builder, model.root, model, material_slots, layer_slots, warnings, "root",
-                     def_builders, stats)
+                     def_builders, stats, builder, notes_of("ROOT"))
+    verluste = verlust_zeilen(model, notes, stats)
+    warnings += verluste
     out.parent.mkdir(parents=True, exist_ok=True)
     save_atomic(builder, out)
     check = SkpFile.open(str(out)).parse()
@@ -742,6 +1355,7 @@ def rewrite_legacy(src: Path, out: Path) -> dict:
         materials=len(check.materials),
         layers=len(check.layers),
         warnings=warnings,
+        verluste=verluste,
     )
     return stats
 
@@ -1059,6 +1673,16 @@ def _nesting_plan(instances):
             "count": {s_id: len(u) for s_id, u in users.items()}, "depth": max(depth, default=0)}
 
 
+def _dump_colorize(value):
+    """Zielfarbe einer getoenten Textur aus dem Dump-Kopf (bridge._MaterialTable) oder None."""
+    if not isinstance(value, dict):
+        return None
+    rgb = value.get("rgb")
+    if not isinstance(rgb, list) or len(rgb) != 3 or not all(isinstance(c, int) for c in rgb):
+        return None
+    return [max(0, min(255, c)) for c in rgb]
+
+
 def write_skp_from_bin(header_path: Path, out: Path, scale_to_inch: float | None = None,
                        textures: bool = True, bin_path: Path | None = None, reparse: bool = True) -> dict:
     """Binaer-Dump aus Blender als SketchUp-2017-Datei schreiben, Instanzen bleiben erhalten.
@@ -1091,7 +1715,11 @@ def write_skp_from_bin(header_path: Path, out: Path, scale_to_inch: float | None
         opacity = None if alpha >= 0.999 else max(0.0, min(1.0, alpha))
         if textures and mt.get("image") and Path(mt["image"]).exists():
             mat_ids.append(b.add_texture_material(name, mt["image"], opacity=opacity))
-            set_texture_average_color(b, image_average_rgb(mt["image"]))
+            tint = _dump_colorize(mt.get("colorize"))
+            if tint is not None and set_texture_colorize(b, tint):
+                stats["colorized_materials"] = stats.get("colorized_materials", 0) + 1
+            else:
+                set_texture_average_color(b, image_average_rgb(mt["image"]))
             stats["textured_materials"] += 1
         else:
             mat_ids.append(b.add_material(name, [int(c) for c in mt["rgba"][:3]] + [255], opacity=opacity))

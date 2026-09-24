@@ -57,7 +57,7 @@ def freier_speicher() -> int | None:
         if os.name == "nt":
             return _frei_windows()
         if sys.platform.startswith("linux"):
-            return _frei_linux()
+            return _kleinster(_frei_linux(), _frei_cgroup())
         if sys.platform == "darwin":
             return _frei_macos()
         pages = os.sysconf("SC_AVPHYS_PAGES")
@@ -97,6 +97,87 @@ def _frei_linux(pfad: str = "/proc/meminfo") -> int | None:
         return werte["MemAvailable"] or None
     frei = sum(werte.get(k, 0) for k in ("MemFree", "Buffers", "Cached"))  # Kernel vor 3.14
     return frei or None
+
+
+def _kleinster(*werte: int | None) -> int | None:
+    bekannt = [w for w in werte if w is not None]
+    return min(bekannt) if bekannt else None
+
+
+# cgroup v1 meldet "keine Grenze" als sehr grosse Zahl (PAGE_COUNTER_MAX, je nach Seitengroesse)
+_CGROUP_OHNE_GRENZE = 2**60
+
+
+def _frei_cgroup(wurzel: str = "/sys/fs/cgroup", selbst: str = "/proc/self/cgroup") -> int | None:
+    """Freier Platz bis zur Speichergrenze der eigenen cgroup, None ohne Grenze.
+
+    /proc/meminfo zeigt in einem Container (docker --memory, Kubernetes, CI) und unter systemd mit
+    MemoryMax den Speicher des ganzen Rechners. Ohne diese Grenze plant der Speicherwaechter zu viele
+    Prozesse ein, und der Kernel beendet sie mitten in der Arbeit (OOM). Beachtet werden die eigene
+    cgroup und alle uebergeordneten (v2: memory.max, v1: memory.limit_in_bytes), jeweils abzueglich
+    des belegten Speichers ohne wieder freigebbaren Dateicache (inactive_file)."""
+    try:
+        with open(selbst, encoding="utf-8", errors="replace") as fh:
+            zeilen = fh.read().splitlines()
+    except OSError:
+        return None
+    frei = None
+    for zeile in zeilen:
+        teile = zeile.split(":", 2)
+        if len(teile) != 3:
+            continue
+        hid, controller, pfad = teile
+        if hid == "0" and controller == "":  # cgroup v2 (eine gemeinsame Hierarchie)
+            for d in _cgroup_ordner(Path(wurzel), pfad):
+                frei = _kleinster(frei, _cgroup_rest(d / "memory.max", d / "memory.current", d / "memory.stat",
+                                                     "inactive_file"))
+        elif "memory" in controller.split(","):  # cgroup v1, eigene Hierarchie fuer den Speicher
+            for d in _cgroup_ordner(Path(wurzel) / "memory", pfad):
+                frei = _kleinster(frei, _cgroup_rest(d / "memory.limit_in_bytes", d / "memory.usage_in_bytes",
+                                                     d / "memory.stat", "total_inactive_file"))
+    return frei
+
+
+def _cgroup_ordner(basis: Path, pfad: str) -> list[Path]:
+    """Ordner der eigenen cgroup und ihrer Vorfahren, soweit sichtbar. Im Container ist die eigene
+    cgroup oft die Wurzel des Mounts, obwohl /proc/self/cgroup einen laengeren Pfad nennt (v1 ohne
+    cgroup-Namensraum); dann bleibt nur die Wurzel. Pfade mit .. (Prozess ausserhalb des Namensraums)
+    werden nicht verfolgt."""
+    teile = [t for t in pfad.strip().split("/") if t]
+    if any(t in (".", "..") for t in teile):
+        teile = []
+    ordner = []
+    for i in range(len(teile), -1, -1):
+        d = basis.joinpath(*teile[:i])
+        if d.is_dir():
+            ordner.append(d)
+    return ordner
+
+
+def _cgroup_rest(grenze: Path, belegt: Path, stat: Path, cache_schluessel: str) -> int | None:
+    try:
+        text = grenze.read_text(encoding="ascii", errors="replace").strip()
+    except OSError:
+        return None
+    if not text.isdigit():  # "max": keine Grenze
+        return None
+    limit = int(text)
+    if limit >= _CGROUP_OHNE_GRENZE:
+        return None
+    try:
+        benutzt = int(belegt.read_text(encoding="ascii", errors="replace").strip())
+    except (OSError, ValueError):
+        return None
+    cache = 0
+    try:
+        for z in stat.read_text(encoding="ascii", errors="replace").splitlines():
+            name, _, wert = z.partition(" ")
+            if name == cache_schluessel and wert.strip().isdigit():
+                cache = int(wert)
+                break
+    except OSError:
+        pass
+    return max(0, limit - max(0, benutzt - cache))
 
 
 def _frei_macos() -> int | None:

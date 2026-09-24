@@ -5,9 +5,13 @@
     skptool mcp --ordner D:\\Projekte   nur Dateien in diesem Ordner (mehrfach moeglich)
 
 Transport: Model Context Protocol ueber stdio, JSON-RPC 2.0, eine JSON-Nachricht pro Zeile auf
-stdin/stdout. Auf stdout steht nie etwas anderes, Meldungen gehen nach stderr. Ohne weitere
-Abhaengigkeit selbst umgesetzt: initialize, notifications/initialized, ping, tools/list,
-tools/call, notifications/cancelled.
+stdin/stdout. Auf stdout steht nie etwas anderes, Meldungen gehen als UTF-8 nach stderr. Ohne
+weitere Abhaengigkeit selbst umgesetzt: initialize, notifications/initialized, ping, tools/list,
+tools/call, notifications/cancelled. Protokollversionen 2024-11-05 bis 2025-11-25; eine unbekannte
+Version beantwortet der Server mit seiner neuesten. JSON-RPC-Batches nur, wenn 2025-03-26
+ausgehandelt ist (nur diese Version verlangt sie). Neuere Clients fragen zuerst server/discover
+(Protokoll 2026-07-28) und fallen bei "Methode unbekannt" auf initialize zurueck.
+Geprueft mit dem MCP Inspector und dem offiziellen Python-SDK: tools/mcp_sdk_pruefung.py.
 
 Sicherheit: Ein KI-Assistent kann durch Inhalte, die er liest, manipuliert werden (Prompt-Injection).
 Deshalb gilt jedes Argument als nicht vertrauenswuerdig:
@@ -47,8 +51,11 @@ from pathlib import Path
 
 from skptool import __version__
 
-PROTOKOLL_STANDARD = "2025-06-18"
-PROTOKOLLE = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+PROTOKOLLE = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # neueste zuerst
+# Antwort auf eine unbekannte Version: laut Spezifikation die neueste, die der Server kann
+PROTOKOLL_STANDARD = PROTOKOLLE[0]
+PROTOKOLL_MIT_BATCH = "2025-03-26"  # nur diese Version verlangt JSON-RPC-Batches (2025-06-18 entfernt sie)
+MAX_STAPEL = 100                  # Eintraege je Batch
 MAX_ZEILE = 16 * 2**20            # eine JSON-RPC-Nachricht (Operationen duerfen bis 10 MB haben)
 MAX_TEXT = 200 * 1024             # Textausgabe je Ergebnis
 LISTEN_STUFEN = (200, 50, 10)     # Eintraege je Liste, bis die Ausgabe unter MAX_TEXT liegt
@@ -65,8 +72,10 @@ OPS_DATEI = Path(__file__).parent / "blender_scripts" / "ops.py"
 
 # Ausgaben nur in Formaten, die genau eine Datei ergeben (.obj schreibt eine .mtl daneben, .gltf
 # und .usd weitere Dateien). .json nicht: der Inhalt stammt teils aus der Eingabe und koennte an
-# Stellen landen, an denen Programme JSON als Einstellungen lesen.
-AUSGABE_ENDUNGEN = (".skp", ".blend", ".glb", ".fbx", ".stl", ".ply", ".dxf", ".ifc", ".usdz", ".abc", ".png")
+# Stellen landen, an denen Programme JSON als Einstellungen lesen. .3mf ist ein einzelnes ZIP mit
+# dem Modell (export_3mf, ohne Blender, nur aus .skp).
+AUSGABE_ENDUNGEN = (".skp", ".blend", ".glb", ".3mf", ".fbx", ".stl", ".ply", ".dxf", ".ifc", ".usdz", ".abc",
+                    ".png")
 
 
 def _eingabe_endungen() -> tuple:
@@ -166,9 +175,10 @@ WERKZEUGE = [
                             "description": "** im Muster durchsucht auch Unterordner"}},
               ["paths"]),
     _werkzeug("skp_convert", "Konvertieren",
-              "Konvertiert zwischen SketchUp und anderen Formaten: .skp nach .blend/.glb/.fbx/.stl/.ply/.dxf/.ifc/"
-              ".usdz/.abc/.png, aus .blend und anderen Blender-lesbaren Dateien zurueck nach .skp (2017-Format), "
-              ".skp nach .skp (ins 2017-Format umschreiben). Schreibt nur eine neue Datei.",
+              "Konvertiert zwischen SketchUp und anderen Formaten: .skp nach .blend/.glb/.3mf/.fbx/.stl/.ply/.dxf/"
+              ".ifc/.usdz/.abc/.png (.3mf fuer den 3D-Druck, nur aus .skp), aus .blend und anderen "
+              "Blender-lesbaren Dateien zurueck nach .skp (2017-Format), .skp nach .skp (ins 2017-Format "
+              "umschreiben). Schreibt nur eine neue Datei.",
               {"input": _pfad_schema("Eingabedatei (.skp, .blend, .glb, .gltf, .fbx, .obj, .stl, .ply, .usd*, .abc)"),
                "output": _pfad_schema(_AUSGABE_TEXT), "ueberschreiben": _UEBERSCHREIBEN},
               ["input", "output"], schreibt=True, blender=True),
@@ -576,6 +586,8 @@ def _w_report(args, ordner):
 def _w_convert(args, ordner):
     src = pruefe_eingabe(args["input"], "input", _eingabe_endungen(), ordner)
     ziel = pruefe_ausgabe(args["output"], "output", [src], args["ueberschreiben"], ordner)
+    if ziel.suffix.lower() == ".3mf" and src.suffix.lower() != ".skp":
+        raise Abgelehnt("output: .3mf entsteht nur aus einer .skp-Datei (erst nach .skp umwandeln)")
     return ergebnis(_konvertiere(src, ziel, args["ueberschreiben"]))
 
 
@@ -583,6 +595,9 @@ def _w_edit(args, ordner):
     ops = pruefe_ops(args["ops"])
     src = pruefe_eingabe(args["input"], "input", _eingabe_endungen(), ordner)
     ziel = pruefe_ausgabe(args["output"], "output", [src], args["ueberschreiben"], ordner)
+    if ziel.suffix.lower() == ".3mf":
+        raise Abgelehnt("output: .3mf geht nicht zusammen mit ops. Erst mit skp_edit nach .skp schreiben, "
+                        "dann mit skp_convert nach .3mf")
     return ergebnis(_konvertiere(src, ziel, args["ueberschreiben"], ops))
 
 
@@ -682,6 +697,11 @@ def _kein_nan(name):
     raise ValueError(f"{name} ist in JSON nicht erlaubt")
 
 
+def _gueltige_id(rid) -> bool:
+    """MCP: RequestId ist Text oder ganze Zahl (nicht null, nicht bool, keine Kommazahl)."""
+    return isinstance(rid, (str, int)) and not isinstance(rid, bool)
+
+
 def _beende_baum(proc: subprocess.Popen) -> None:
     """Arbeitsprozess samt Kindern (Blender) beenden."""
     if proc.poll() is not None:
@@ -701,10 +721,89 @@ def _beende_baum(proc: subprocess.Popen) -> None:
         pass
 
 
+# Windows Known Folders. MCP-Clients starten Server oft mit einer knappen Umgebung (das Python-SDK
+# gibt unter Windows z. B. kein ProgramFiles weiter). Ohne ProgramFiles faende der Arbeitsprozess
+# Blender nicht, ohne LOCALAPPDATA laege die Live-Statusdatei woanders als bei skptool open --live.
+_BEKANNTE_ORDNER = {
+    "PROGRAMFILES": "905e63b6-c1bf-494e-b29c-65b732d3d21a",
+    "PROGRAMFILES(X86)": "7c5a40ef-a0fb-4bfc-874a-c0f2e0b9fa8e",
+    "LOCALAPPDATA": "f1b32785-6fba-4fcf-9d55-7b8e7f157091",
+}
+
+
+def _windows_ordner(guid: str) -> str | None:
+    """Pfad eines Windows Known Folder (vom System, nicht aus der Umgebung), sonst None."""
+    import ctypes
+    import uuid
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    u = uuid.UUID(guid)
+    g = GUID(u.fields[0], u.fields[1], u.fields[2], (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+    zeiger = ctypes.c_void_p()
+    try:
+        shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        shell32.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+                                                 ctypes.POINTER(ctypes.c_void_p)]
+        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+        try:
+            if shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(zeiger)) != 0:
+                return None
+            return ctypes.wstring_at(zeiger.value) if zeiger.value else None
+        finally:
+            ole32.CoTaskMemFree(zeiger)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _windows_ordner_ergaenzen(env: dict) -> None:
+    """Fehlende Ordner-Variablen fuer den Arbeitsprozess ergaenzen; vorhandene bleiben unveraendert."""
+    vorhanden = {k.upper() for k, v in env.items() if v}
+    for name, guid in _BEKANNTE_ORDNER.items():
+        if name not in vorhanden:
+            pfad = _windows_ordner(guid)
+            if pfad and os.path.isabs(pfad) and not pfad.replace("\\", "/").startswith("//"):
+                env[name] = pfad
+
+
 class _Aufruf:
     def __init__(self):
         self.proc: subprocess.Popen | None = None
         self.abgebrochen = False
+
+
+class _Sammler:
+    """Antworten eines JSON-RPC-Batches sammeln und als ein Array senden, sobald alle da sind.
+
+    offen zaehlt den Batch selbst (bis alle Eintraege gelesen sind) und jeden laufenden
+    tools/call. Ein abgebrochener Aufruf liefert None: er bekommt keine Antwort, zaehlt aber ab."""
+
+    def __init__(self, server: "Server"):
+        self.server = server
+        self.antworten: list = []
+        self.offen = 1
+        self.sperre = threading.Lock()
+
+    def hinzu(self, msg: dict) -> None:
+        with self.sperre:
+            self.antworten.append(msg)
+
+    def erwarten(self) -> None:
+        with self.sperre:
+            self.offen += 1
+
+    def liefern(self, msg) -> None:
+        with self.sperre:
+            if msg is not None:
+                self.antworten.append(msg)
+            self.offen -= 1
+            fertig = self.offen == 0
+        if fertig and self.antworten:  # nur Benachrichtigungen: keine Antwort (JSON-RPC 2.0)
+            self.server.senden(self.antworten)
 
 
 class Server:
@@ -718,10 +817,11 @@ class Server:
         self.aufrufe: dict[str, _Aufruf] = {}
         self.threads: list[threading.Thread] = []
         self.offen = True
+        self.protokoll: str | None = None  # ausgehandelt mit initialize
 
     # -- Senden
 
-    def senden(self, msg: dict) -> None:
+    def senden(self, msg) -> None:
         zeile = json.dumps(msg, ensure_ascii=True, separators=(",", ":"), default=_json_default) + "\n"
         with self.schreib_sperre:
             if not self.offen:
@@ -732,14 +832,20 @@ class Server:
             except (OSError, ValueError):
                 self.offen = False
 
-    def antwort(self, rid, result) -> None:
-        self.senden({"jsonrpc": "2.0", "id": rid, "result": result})
+    def _raus(self, msg: dict, sammler: _Sammler | None) -> None:
+        if sammler is None:
+            self.senden(msg)
+        else:
+            sammler.hinzu(msg)
 
-    def fehler(self, rid, code: int, text: str, daten=None) -> None:
+    def antwort(self, rid, result, sammler: _Sammler | None = None) -> None:
+        self._raus({"jsonrpc": "2.0", "id": rid, "result": result}, sammler)
+
+    def fehler(self, rid, code: int, text: str, daten=None, sammler: _Sammler | None = None) -> None:
         err = {"code": code, "message": text}
         if daten is not None:
             err["data"] = daten
-        self.senden({"jsonrpc": "2.0", "id": rid, "error": err})
+        self._raus({"jsonrpc": "2.0", "id": rid, "error": err}, sammler)
 
     # -- Lesen
 
@@ -780,30 +886,64 @@ class Server:
         except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             self.fehler(None, PARSE_ERROR, f"Kein gueltiges JSON: {str(exc)[:200]}")
             return
+        if isinstance(msg, list):
+            self.stapel(msg)
+        else:
+            self.sicher(msg, None)
+
+    def sicher(self, msg, sammler: _Sammler | None) -> None:
+        """Eine Nachricht bearbeiten; ein Programmfehler beendet nie den Server."""
         try:
-            self.nachricht(msg)
+            self.nachricht(msg, sammler)
         except Exception as exc:  # noqa: BLE001 - der Server laeuft weiter
             _log("interner Fehler:\n" + traceback.format_exc())
-            rid = msg.get("id") if isinstance(msg, dict) else None
-            if isinstance(msg, dict) and "method" in msg and "id" in msg:
-                self.fehler(rid, INTERNAL_ERROR, f"Interner Fehler: {type(exc).__name__}: {exc}")
+            if isinstance(msg, dict) and "method" in msg and _gueltige_id(msg.get("id")):
+                self.fehler(msg["id"], INTERNAL_ERROR, f"Interner Fehler: {type(exc).__name__}: {exc}",
+                            sammler=sammler)
 
-    def nachricht(self, msg) -> None:
+    def stapel(self, msgs: list) -> None:
+        """JSON-RPC-Batch. Nur Protokoll 2025-03-26 verlangt sie; 2025-06-18 hat sie wieder entfernt."""
+        if self.protokoll != PROTOKOLL_MIT_BATCH:
+            self.fehler(None, INVALID_REQUEST, f"JSON-RPC-Batches gibt es nur mit Protokoll {PROTOKOLL_MIT_BATCH} "
+                                               f"(ausgehandelt: {self.protokoll or 'noch keines'})")
+            return
+        if not msgs:
+            self.fehler(None, INVALID_REQUEST, "Leerer Batch")
+            return
+        if len(msgs) > MAX_STAPEL:
+            self.fehler(None, INVALID_REQUEST, f"Batch mit {len(msgs)} Eintraegen, hoechstens {MAX_STAPEL}")
+            return
+        sammler = _Sammler(self)
+        for msg in msgs:
+            if isinstance(msg, dict) and msg.get("method") == "initialize":
+                if _gueltige_id(msg.get("id")):  # initialize darf laut Spezifikation nicht im Batch stehen
+                    self.fehler(msg["id"], INVALID_REQUEST, "initialize darf nicht in einem Batch stehen",
+                                sammler=sammler)
+                continue
+            if isinstance(msg, list):
+                self.fehler(None, INVALID_REQUEST, "Ungueltige Anfrage: Batch im Batch", sammler=sammler)
+                continue
+            self.sicher(msg, sammler)
+        sammler.liefern(None)  # alle Eintraege gelesen
+
+    def nachricht(self, msg, sammler: _Sammler | None = None) -> None:
         if isinstance(msg, list):
-            self.fehler(None, INVALID_REQUEST, "JSON-RPC-Batches werden nicht unterstuetzt")
+            self.fehler(None, INVALID_REQUEST, "JSON-RPC-Batches werden nicht unterstuetzt", sammler=sammler)
             return
         if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
-            self.fehler(None, INVALID_REQUEST, "Ungueltige Anfrage: jsonrpc \"2.0\" fehlt")
+            rid = msg.get("id") if isinstance(msg, dict) and _gueltige_id(msg.get("id")) else None
+            self.fehler(rid, INVALID_REQUEST, "Ungueltige Anfrage: jsonrpc \"2.0\" fehlt", sammler=sammler)
             return
         if "method" not in msg:
             return  # Antwort auf eine Anfrage, die dieser Server nie stellt
         methode, hat_id, rid = msg["method"], "id" in msg, msg.get("id")
-        if hat_id and (rid is None or isinstance(rid, bool) or not isinstance(rid, (str, int))):
-            self.fehler(None, INVALID_REQUEST, "Ungueltige Anfrage: id muss Text oder ganze Zahl sein")
+        if hat_id and not _gueltige_id(rid):
+            self.fehler(None, INVALID_REQUEST, "Ungueltige Anfrage: id muss Text oder ganze Zahl sein",
+                        sammler=sammler)
             return
         if not isinstance(methode, str):
             if hat_id:
-                self.fehler(rid, INVALID_REQUEST, "Ungueltige Anfrage: method muss ein Text sein")
+                self.fehler(rid, INVALID_REQUEST, "Ungueltige Anfrage: method muss ein Text sein", sammler=sammler)
             return
         params = msg.get("params", {})
         if not hat_id:  # Benachrichtigung: nie beantworten, unbekannte ignorieren
@@ -813,25 +953,26 @@ class Server:
         if params is None:
             params = {}
         if not isinstance(params, dict):
-            self.fehler(rid, INVALID_PARAMS, "params muss ein Objekt sein")
+            self.fehler(rid, INVALID_PARAMS, "params muss ein Objekt sein", sammler=sammler)
             return
         if methode == "initialize":
             self.initialize(rid, params)
         elif methode == "ping":
-            self.antwort(rid, {})
+            self.antwort(rid, {}, sammler)
         elif methode == "tools/list":
-            self.antwort(rid, {"tools": werkzeuge(self.nur_lesen)})
+            self.antwort(rid, {"tools": werkzeuge(self.nur_lesen)}, sammler)
         elif methode == "tools/call":
-            self.tools_call(rid, params)
+            self.tools_call(rid, params, sammler)
         else:
-            self.fehler(rid, METHOD_NOT_FOUND, f"Unbekannte Methode: {methode[:100]}")
+            self.fehler(rid, METHOD_NOT_FOUND, f"Unbekannte Methode: {methode[:100]}", sammler=sammler)
 
     def initialize(self, rid, params) -> None:
         gewuenscht = params.get("protocolVersion")
         version = gewuenscht if gewuenscht in PROTOKOLLE else PROTOKOLL_STANDARD
+        self.protokoll = version
         info = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else {}
         _log(f"verbunden mit {str(info.get('name', '?'))[:60]} {str(info.get('version', ''))[:20]}, "
-             f"Protokoll {version}")
+             f"Protokoll {version}" + ("" if version == gewuenscht else f" (gewuenscht: {_kurz(gewuenscht, 40)})"))
         self.antwort(rid, {
             "protocolVersion": version,
             "capabilities": {"tools": {}},
@@ -844,20 +985,20 @@ class Server:
 
     # -- Werkzeuge
 
-    def tools_call(self, rid, params) -> None:
+    def tools_call(self, rid, params, sammler: _Sammler | None = None) -> None:
         name, args = params.get("name"), params.get("arguments")
         if not isinstance(name, str):
-            self.fehler(rid, INVALID_PARAMS, "tools/call braucht name (Text)")
+            self.fehler(rid, INVALID_PARAMS, "tools/call braucht name (Text)", sammler=sammler)
             return
         werkzeug = self.werkzeuge.get(name)
         if werkzeug is None:
             hinweis = " (Server laeuft mit --nur-lesen)" if self.nur_lesen and name in AUSFUEHREN else ""
-            self.fehler(rid, INVALID_PARAMS, f"Unbekanntes Werkzeug: {name[:100]}{hinweis}")
+            self.fehler(rid, INVALID_PARAMS, f"Unbekanntes Werkzeug: {name[:100]}{hinweis}", sammler=sammler)
             return
         if args is None:
             args = {}
         if not isinstance(args, dict):
-            self.fehler(rid, INVALID_PARAMS, "arguments muss ein Objekt sein")
+            self.fehler(rid, INVALID_PARAMS, "arguments muss ein Objekt sein", sammler=sammler)
             return
         try:  # Eingabefehler als Werkzeugergebnis, damit das Modell sie korrigieren kann
             pruefe_schema(args, werkzeug["inputSchema"])
@@ -865,18 +1006,20 @@ class Server:
             if "ops" in args:
                 pruefe_ops(args["ops"])
         except Abgelehnt as exc:
-            self.antwort(rid, fehler_ergebnis(f"Ungueltige Argumente fuer {name}: {exc}"))
+            self.antwort(rid, fehler_ergebnis(f"Ungueltige Argumente fuer {name}: {exc}"), sammler)
             return
         schluessel = json.dumps(rid)
         with self.sperre:
             if schluessel in self.aufrufe:
-                self.fehler(rid, INVALID_REQUEST, "Diese id wird schon bearbeitet")
+                self.fehler(rid, INVALID_REQUEST, "Diese id wird schon bearbeitet", sammler=sammler)
                 return
             if len(self.aufrufe) >= MAX_GLEICHZEITIG + MAX_WARTEND:
-                self.antwort(rid, fehler_ergebnis("Zu viele gleichzeitige Aufrufe, bitte spaeter erneut"))
+                self.antwort(rid, fehler_ergebnis("Zu viele gleichzeitige Aufrufe, bitte spaeter erneut"), sammler)
                 return
             auf = self.aufrufe[schluessel] = _Aufruf()
-        th = threading.Thread(target=self._arbeite, args=(rid, schluessel, auf, name, args), daemon=True)
+        if sammler is not None:
+            sammler.erwarten()
+        th = threading.Thread(target=self._arbeite, args=(rid, schluessel, auf, name, args, sammler), daemon=True)
         self.threads = [t for t in self.threads if t.is_alive()] + [th]
         th.start()
 
@@ -889,7 +1032,7 @@ class Server:
                 _beende_baum(auf.proc)
             _log(f"Aufruf {_kurz(rid, 40)} abgebrochen")
 
-    def _arbeite(self, rid, schluessel, auf: _Aufruf, name, args) -> None:
+    def _arbeite(self, rid, schluessel, auf: _Aufruf, name, args, sammler: _Sammler | None = None) -> None:
         try:
             erg = self._im_prozess(auf, name, args)
         except Exception as exc:  # noqa: BLE001
@@ -898,14 +1041,20 @@ class Server:
         finally:
             with self.sperre:
                 self.aufrufe.pop(schluessel, None)
-        if not auf.abgebrochen:  # abgebrochene Anfragen bekommen keine Antwort
-            self.antwort(rid, erg)
+        # abgebrochene Anfragen bekommen keine Antwort
+        msg = None if auf.abgebrochen else {"jsonrpc": "2.0", "id": rid, "result": erg}
+        if sammler is not None:
+            sammler.liefern(msg)
+        elif msg is not None:
+            self.senden(msg)
 
     def _umgebung(self) -> dict:
         env = dict(os.environ)
         alt = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and os.path.isabs(p)]
         env["PYTHONPATH"] = os.pathsep.join([str(PROJEKT), *alt])
         env["PYTHONIOENCODING"] = "utf-8"
+        if os.name == "nt":
+            _windows_ordner_ergaenzen(env)
         # Blender-Schritte enden spaetestens mit dem Zeitlimit, auch falls das Beenden des Baums scheitert
         try:
             bisher = float(env.get("SKPTOOL_TIMEOUT", "3600"))
@@ -997,7 +1146,7 @@ def cmd_mcp(a) -> int:
         if not pfad.is_dir():
             raise SystemExit(f"--ordner: kein Ordner: {o}")
         ordner.append(str(pfad))
-    ausgang = sys.stdout.buffer
+    ausgang = sys.stdout.buffer  # stderr ist schon UTF-8 (cli.main), wie die Spezifikation es verlangt
     sys.stdout = sys.stderr  # stdout gehoert allein dem Protokoll
     server = Server(sys.stdin.buffer, ausgang, nur_lesen=a.nur_lesen, timeout=a.timeout, ordner=ordner)
     try:

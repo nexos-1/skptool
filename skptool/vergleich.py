@@ -6,8 +6,10 @@ bevor die zweite Datei geladen wird: grosse Dateien brauchen beim Einlesen viel 
 
 Zuordnung: Ebenen, Materialien und benannte Definitionen ueber den Namen. Gruppen-Definitionen
 ("Group#12") ueber ihren Inhalt (Flaechen und Namen der Kinder), weil sich ihre Nummern beim
-Umschreiben aendern. Platzierungen ueber ihren Pfad ("ROOT / Tisch / Bein") als Multimenge, gepaart
-ueber die Weltmatrix mit Toleranz.
+Umschreiben aendern. Platzierungen ueber ihren Pfad ("ROOT / Tisch / Bein") von oben nach unten: die
+Kinder eines Paars werden nur untereinander gepaart, ueber ihre Lage relativ zur uebergeordneten
+Platzierung (Toleranz in mm), gleiche zuerst, der Rest optimal (Ungarische Methode). So meldet ein
+verschobener Tisch nur den Tisch, und gleiche Beine mit vertauschten Plaetzen gelten als gleich.
 
 Optional: platzierte Geometrie (--geometrie) und Texturlage (--texturen), beide ueber den
 Szenenaufbau von OpenSKP. Die Funktionen dafuer nutzen auch tools/geometrievergleich.py und
@@ -39,6 +41,8 @@ TITEL = {"modell": "Modell", "ebenen": "Ebenen", "materialien": "Materialien",
 LIMIT = 25  # Eintraege je Abschnitt ohne --all, wie bei info
 _LIN_TOL = 1e-5  # Drehung/Skalierung: Rechenrauschen aus Blender (float32) gilt als gleich
 _MAX_PAARE = 4_000_000  # groessere Restmengen je Pfad werden ueber die Sortierung gepaart
+_MAX_OPTIMAL = 250_000  # bis zu so vielen Paaren (n x m) optimal zuordnen, darueber naechste zuerst
+_EINHEIT = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
 
 
 class VergleichsFehler(Exception):
@@ -278,10 +282,18 @@ def _struktur(m) -> dict:
 
     pfade: list = []
     attrs: list = []
-    matrizen = array.array("d")  # 12 Werte je Platzierung, kompakt auch bei Millionen
+    matrizen = array.array("d")  # Weltmatrix, 12 Werte je Platzierung, kompakt auch bei Millionen
+    lokal = array.array("d")  # dasselbe relativ zur uebergeordneten Platzierung
+    eltern = array.array("q")  # Index der uebergeordneten Platzierung, -1 fuer das Modell selbst
     intern: dict = {}
 
-    def walk(defn, matrix, path, layer, depth=0):
+    def zeile(mm, ziel):
+        w = mm[12] if len(mm) > 12 and mm[12] not in (0, None) else 1.0
+        ziel.extend([mm[0] / w, mm[1] / w, mm[2] / w, mm[3] / w, mm[4] / w, mm[5] / w,
+                     mm[6] / w, mm[7] / w, mm[8] / w,
+                     mm[9] * 25.4 / w, mm[10] * 25.4 / w, mm[11] * 25.4 / w])
+
+    def walk(defn, matrix, path, layer, oben, depth=0):
         if depth > 64:
             return
         for inst in defn.instances:
@@ -293,19 +305,19 @@ def _struktur(m) -> dict:
             p = f"{path} / {teil}"
             p = intern.setdefault(p, p)
             lay = inst.layer if inst.layer not in (None, "", "Layer0") else layer
+            nr = len(pfade)
             pfade.append(p)
+            eltern.append(oben)
             eig = (kurzname(inst.ref_idx), lay, bool(inst.hidden))
             attrs.append(intern.setdefault(eig, eig))  # gleiche Tupel teilen, spart Speicher
-            w = mm[12] if len(mm) > 12 and mm[12] not in (0, None) else 1.0
-            matrizen.extend([mm[0] / w, mm[1] / w, mm[2] / w, mm[3] / w, mm[4] / w, mm[5] / w,
-                             mm[6] / w, mm[7] / w, mm[8] / w,
-                             mm[9] * 25.4 / w, mm[10] * 25.4 / w, mm[11] * 25.4 / w])
+            zeile(mm, matrizen)
+            zeile(inst.matrix or _EINHEIT, lokal)  # leer: wie multiply_matrices die Einheitsmatrix
             if len(pfade) > core.MAX_PLACEMENTS:
                 raise core.UnsafeFileError(f"mehr als {core.MAX_PLACEMENTS} Platzierungen (verschachtelte "
                                            "Komponenten vervielfachen sich), anhebbar mit SKPTOOL_MAX_PLACEMENTS")
-            walk(ref, mm, p, lay, depth + 1)
+            walk(ref, mm, p, lay, nr, depth + 1)
 
-    walk(m.root, [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1.0], "ROOT", "Layer0")
+    walk(m.root, _EINHEIT, "ROOT", "Layer0", -1)
 
     alle = [m.root, *defs.values()]
     bemassungen = len(m.dimensions or []) or sum(len(d.dimensions or []) for d in alle)
@@ -316,7 +328,9 @@ def _struktur(m) -> dict:
         "materialien": [_material(mt) for mt in m.materials if mt.id is not None],
         "definitionen": definitionen,
         "platzierungen": {"pfade": pfade, "attrs": attrs,
-                          "matrizen": np.frombuffer(matrizen, np.float64).reshape(-1, 12).copy()},
+                          "matrizen": np.frombuffer(matrizen, np.float64).reshape(-1, 12).copy(),
+                          "lokal": np.frombuffer(lokal, np.float64).reshape(-1, 12).copy(),
+                          "eltern": np.frombuffer(eltern, np.int64).copy()},
         "modell": {"szenen": len(m.pages or []), "bemassungen": bemassungen,
                    "texte": sum(len(d.texts or []) for d in alle),
                    "schnittebenen": sum(len(d.section_planes or []) for d in alle),
@@ -513,14 +527,56 @@ def _vergleiche_modell(a, b):
     return ab
 
 
-def _paare_nach_abstand(ma, mb, ia, ib):
-    """Restliche Platzierungen eines Pfads paaren, naechste Position zuerst."""
-    if not ia or not ib:
+def zuordnung(kosten) -> list:
+    """Optimale Zuordnung (Ungarische Methode mit kuerzesten Erweiterungspfaden, wie Jonker-Volgenant):
+    min(n, m) Paare (Zeile, Spalte) mit der kleinsten Kostensumme. Nur numpy, jede innere Runde ist ein
+    Vektorschritt ueber alle Spalten; schlechtester Fall O(n^2 m), deshalb nur fuer begrenzte Mengen."""
+    k = np.asarray(kosten, np.float64)
+    if k.ndim != 2 or not k.size:
         return []
-    if len(ia) * len(ib) > _MAX_PAARE:
-        oa = sorted(ia, key=lambda i: tuple(ma[i, 9:12]))
-        ob = sorted(ib, key=lambda i: tuple(mb[i, 9:12]))
-        return list(zip(oa, ob))
+    n, m = k.shape
+    if n > m:
+        return sorted((x, y) for y, x in zuordnung(k.T))
+    u = np.zeros(n + 1)
+    v = np.zeros(m + 1)
+    p = np.zeros(m + 1, np.int64)  # p[j]: Zeile (ab 1) in Spalte j, 0 = frei; Spalte 0 ist ein Hilfsknoten
+    weg = np.zeros(m + 1, np.int64)
+    cur = np.full(m + 1, np.inf)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = np.full(m + 1, np.inf)
+        benutzt = np.zeros(m + 1, bool)
+        while True:
+            benutzt[j0] = True
+            i0 = p[j0]
+            frei = ~benutzt
+            cur[1:] = k[i0 - 1] - u[i0] - v[1:]
+            besser = frei & (cur < minv)
+            minv[besser] = cur[besser]
+            weg[besser] = j0
+            kand = np.where(frei, minv, np.inf)
+            j1 = int(np.argmin(kand))
+            delta = kand[j1]
+            if p[j1]:  # bei Gleichstand eine freie Spalte nehmen, sonst laeuft der Pfad durch alle belegten
+                leer = np.flatnonzero((kand == delta) & (p == 0))
+                if len(leer):
+                    j1 = int(leer[0])
+            u[p[benutzt]] += delta  # die Zeilen benutzter Spalten sind verschieden
+            v[benutzt] -= delta
+            minv[frei] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while j0:  # Erweiterungspfad umlegen
+            j1 = int(weg[j0])
+            p[j0] = p[j1]
+            j0 = j1
+    return sorted((int(p[j]) - 1, j - 1) for j in range(1, m + 1) if p[j])
+
+
+def _abstaende(ma, mb, ia, ib):
+    """Je Paar: Verschiebung in mm und groesste Abweichung in Drehung/Skalierung."""
     sa, sb = ma[ia], mb[ib]
     # spaltenweise, damit kein (n, m, 12)-Zwischenfeld entsteht
     quad = np.zeros((len(ia), len(ib)))
@@ -531,9 +587,24 @@ def _paare_nach_abstand(ma, mb, ia, ib):
             quad += d * d
         else:
             np.maximum(lin, np.abs(d), out=lin)
-    kosten = np.sqrt(quad) + lin * 1e-3
+    return np.sqrt(quad), lin
+
+
+def _paare_nach_sortierung(ma, mb, ia, ib):
+    oa = sorted(ia, key=lambda i: tuple(ma[i, 9:12]))
+    ob = sorted(ib, key=lambda i: tuple(mb[i, 9:12]))
+    return list(zip(oa, ob))
+
+
+def _paare_gierig(kosten, ia, ib, erlaubt=None):
+    """Naechste zuerst; mit erlaubt nur diese Paare."""
     paare, frei_a, frei_b = [], set(range(len(ia))), set(range(len(ib)))
-    for flat in np.argsort(kosten, axis=None, kind="stable"):
+    if erlaubt is None:
+        reihe = np.argsort(kosten, axis=None, kind="stable")
+    else:
+        flach = np.flatnonzero(erlaubt)
+        reihe = flach[np.argsort(kosten.ravel()[flach], kind="stable")]
+    for flat in reihe:
         x, y = divmod(int(flat), len(ib))
         if x in frei_a and y in frei_b:
             paare.append((ia[x], ib[y]))
@@ -542,6 +613,52 @@ def _paare_nach_abstand(ma, mb, ia, ib):
             if not frei_a or not frei_b:
                 break
     return paare
+
+
+def _paare_nach_abstand(ma, mb, ia, ib):
+    """Restliche Platzierungen paaren: optimal (kleinste Summe der quadrierten Abstaende), bei sehr
+    vielen naechste Position zuerst, bei riesigen Mengen ueber die Sortierung.
+
+    Quadriert, weil sonst eine Reihe gleicher Teile, die entlang ihrer eigenen Linie verschoben wird,
+    beliebig gepaart werden koennte (jede Zuordnung haette dieselbe Summe). Mit Quadraten ist die
+    Paarung "jedes Teil um denselben Weg" die einzige beste."""
+    if not ia or not ib:
+        return []
+    if len(ia) * len(ib) > _MAX_PAARE:
+        return _paare_nach_sortierung(ma, mb, ia, ib)
+    weg, lin = _abstaende(ma, mb, ia, ib)
+    if len(ia) * len(ib) <= _MAX_OPTIMAL:
+        # Gleich viele auf beiden Seiten: B vorher um die mittlere Verschiebung zuruecksetzen. Bei
+        # quadrierten Abstaenden aendert das jede Zeile und Spalte nur um eine Konstante, also nicht
+        # die beste Zuordnung (jede Zeile und Spalte kommt genau einmal vor), erspart der Suche aber
+        # lange Umwege, wenn alles um denselben Weg verschoben wurde
+        ta, tb = ma[ia, 9:12], mb[ib, 9:12]
+        if len(ia) == len(ib):
+            tb = tb - (tb.mean(axis=0) - ta.mean(axis=0))
+        quad = np.zeros((len(ia), len(ib)))
+        for k in range(3):
+            d = ta[:, k, None] - tb[None, :, k]
+            quad += d * d
+        return [(ia[x], ib[y]) for x, y in zuordnung(quad + lin * 1e-3)]
+    return _paare_gierig(weg + lin * 1e-3, ia, ib)
+
+
+def _kinder(p) -> dict:
+    """Uebergeordnete Platzierung (-1 = Modell) -> Pfad -> Platzierungen darin."""
+    out: dict = {}
+    for i, (oben, pfad) in enumerate(zip(p["eltern"].tolist(), p["pfade"])):
+        out.setdefault(oben, {}).setdefault(pfad, []).append(i)
+    return out
+
+
+def _enthalten(kinder, i) -> int:
+    """Wie viele Platzierungen unterhalb von i liegen (alle Ebenen)."""
+    n, offen = 0, [i]
+    while offen:
+        for js in kinder.get(offen.pop(), {}).values():
+            n += len(js)
+            offen.extend(js)
+    return n
 
 
 def _platzierung(p, i) -> dict:
@@ -553,14 +670,16 @@ def _platzierung(p, i) -> dict:
 
 
 def _vergleiche_platzierungen(pa, pb, tol_mm):
+    """Platzierungen von oben nach unten paaren: zuerst die im Modell selbst, dann jeweils die Kinder
+    eines Paars untereinander, getrennt nach Pfad. Verglichen wird die Lage relativ zur
+    uebergeordneten Platzierung: wird eine Gruppe verschoben, meldet der Vergleich nur die Gruppe,
+    nicht jedes Teil darin. Je Pfad erst die gleichen (Rasterzelle, dann ueber Rasterkanten hinweg),
+    dann die uebrigen mit der kleinsten Summe der Abstaende (Ungarische Methode). Platzierungen ohne
+    Gegenstueck werden mit der Zahl ihrer Teile gemeldet, ihre Teile nicht noch einmal einzeln."""
     ab = _abschnitt()
-    ma, mb = pa["matrizen"], pb["matrizen"]
-    ja: dict = {}
-    jb: dict = {}
-    for i, p in enumerate(pa["pfade"]):
-        ja.setdefault(p, []).append(i)
-    for i, p in enumerate(pb["pfade"]):
-        jb.setdefault(p, []).append(i)
+    wa, wb = pa["matrizen"], pb["matrizen"]  # Weltlage, nur fuer die Ausgabe
+    ma, mb = pa["lokal"], pb["lokal"]
+    ka, kb = _kinder(pa), _kinder(pb)
 
     def raster(m):
         zellen = np.floor(m[:, 9:12] / tol_mm).astype(np.int64).tolist()
@@ -577,58 +696,78 @@ def _vergleiche_platzierungen(pa, pb, tol_mm):
     def ort(m, i):
         return "(" + ", ".join(_mm(v) for v in m[i, 9:12]) + ") mm"
 
-    for pfad in sorted(set(ja) | set(jb)):
-        ia, ib = ja.get(pfad, []), jb.get(pfad, [])
-        # 1. schnell: gleiche Rasterzelle und gleiche Eigenschaften
-        eimer: dict = {}
-        for j in ib:
-            eimer.setdefault((pb["attrs"][j], rb[j]), []).append(j)
-        rest_a = []
-        for i in ia:
-            kand = eimer.get((pa["attrs"][i], ra[i]))
-            j = next((j for j in kand or [] if gleich(i, j)), None)
-            if j is None:
-                rest_a.append(i)
-            else:
-                kand.remove(j)
-                ab["gleich"] += 1
-        rest_b = [j for js in eimer.values() for j in js]
-        # 2. innerhalb der Toleranz, aber ueber eine Rasterkante hinweg
-        if rest_a and rest_b:
+    def mit_teilen(kinder, i):
+        n = _enthalten(kinder, i)
+        return f", mit {n} enthaltenen Platzierung{'' if n == 1 else 'en'}" if n else ""
+
+    funde = []  # (Pfad, Rang, Art, Text, Zusatz), am Ende nach Pfad sortiert wie bisher
+    stapel = [(-1, -1)]
+    while stapel:
+        oben_a, oben_b = stapel.pop()
+        ga, gb = ka.get(oben_a, {}), kb.get(oben_b, {})
+        for pfad in sorted(set(ga) | set(gb)):
+            ia, ib = ga.get(pfad, []), gb.get(pfad, [])
+            # 1. schnell: gleiche Rasterzelle und gleiche Eigenschaften
+            eimer: dict = {}
+            for j in ib:
+                eimer.setdefault((pb["attrs"][j], rb[j]), []).append(j)
+            rest_a = []
+            for i in ia:
+                kand = eimer.get((pa["attrs"][i], ra[i]))
+                j = next((j for j in kand or [] if gleich(i, j)), None)
+                if j is None:
+                    rest_a.append(i)
+                else:
+                    kand.remove(j)
+                    ab["gleich"] += 1
+                    stapel.append((i, j))
+            rest_b = [j for js in eimer.values() for j in js]
+            # 2. innerhalb der Toleranz, aber ueber eine Rasterkante hinweg: naechste zuerst
+            if rest_a and rest_b:
+                if len(rest_a) * len(rest_b) > _MAX_PAARE:
+                    kandidaten = [(i, j) for i, j in _paare_nach_sortierung(ma, mb, rest_a, rest_b)
+                                  if gleich(i, j)]
+                else:
+                    weg, lin = _abstaende(ma, mb, rest_a, rest_b)
+                    erlaubt = (weg <= tol_mm) & (lin <= _LIN_TOL)
+                    kandidaten = [(i, j) for i, j in _paare_gierig(weg + lin * 1e-3, rest_a, rest_b, erlaubt)
+                                  if gleich(i, j)] if erlaubt.any() else []
+                for i, j in kandidaten:
+                    ab["gleich"] += 1
+                    stapel.append((i, j))
+                gepaart_a, gepaart_b = {i for i, _ in kandidaten}, {j for _, j in kandidaten}
+                rest_a = [i for i in rest_a if i not in gepaart_a]
+                rest_b = [j for j in rest_b if j not in gepaart_b]
+            # 3. geaendert: kleinste Summe der Abstaende
             gepaart_a, gepaart_b = set(), set()
             for i, j in _paare_nach_abstand(ma, mb, rest_a, rest_b):
-                if gleich(i, j):
-                    gepaart_a.add(i)
-                    gepaart_b.add(j)
-                    ab["gleich"] += 1
-            rest_a = [i for i in rest_a if i not in gepaart_a]
-            rest_b = [j for j in rest_b if j not in gepaart_b]
-        # 3. geaendert: naechste Position zuerst
-        gepaart_a, gepaart_b = set(), set()
-        for i, j in _paare_nach_abstand(ma, mb, rest_a, rest_b):
-            gepaart_a.add(i)
-            gepaart_b.add(j)
-            teile = []
-            weg = float(np.linalg.norm(ma[i, 9:12] - mb[j, 9:12]))
-            if weg > tol_mm:
-                teile.append(f"verschoben um {_mm(weg)} mm")
-            if float(np.abs(ma[i, :9] - mb[j, :9]).max()) > _LIN_TOL:
-                teile.append("gedreht oder skaliert")
-            (da, la, ha), (db, lb, hb) = pa["attrs"][i], pb["attrs"][j]
-            if da != db:
-                teile.append(f"Definition {da} -> {db}")
-            if la != lb:
-                teile.append(f"Ebene {la} -> {lb}")
-            if ha != hb:
-                teile.append(f"ausgeblendet {_janein(ha)} -> {_janein(hb)}")
-            _eintrag(ab, "geaendert", pfad, ", ".join(teile), verschoben_mm=round(weg, 4),
-                     a=_platzierung(pa, i), b=_platzierung(pb, j))
-        for i in rest_a:
-            if i not in gepaart_a:
-                _eintrag(ab, "nur_in_a", pfad, f"{pa['attrs'][i][0]} bei {ort(ma, i)}")
-        for j in rest_b:
-            if j not in gepaart_b:
-                _eintrag(ab, "nur_in_b", pfad, f"{pb['attrs'][j][0]} bei {ort(mb, j)}")
+                gepaart_a.add(i)
+                gepaart_b.add(j)
+                stapel.append((i, j))
+                teile = []
+                weg = float(np.linalg.norm(ma[i, 9:12] - mb[j, 9:12]))
+                if weg > tol_mm:
+                    teile.append(f"verschoben um {_mm(weg)} mm")
+                if float(np.abs(ma[i, :9] - mb[j, :9]).max()) > _LIN_TOL:
+                    teile.append("gedreht oder skaliert")
+                (da, la, ha), (db, lb, hb) = pa["attrs"][i], pb["attrs"][j]
+                if da != db:
+                    teile.append(f"Definition {da} -> {db}")
+                if la != lb:
+                    teile.append(f"Ebene {la} -> {lb}")
+                if ha != hb:
+                    teile.append(f"ausgeblendet {_janein(ha)} -> {_janein(hb)}")
+                funde.append((pfad, 0, "geaendert", ", ".join(teile),
+                               {"verschoben_mm": round(weg, 4), "a": _platzierung(pa, i), "b": _platzierung(pb, j)}))
+            for i in rest_a:
+                if i not in gepaart_a:
+                    funde.append((pfad, 1, "nur_in_a", f"{pa['attrs'][i][0]} bei {ort(wa, i)}{mit_teilen(ka, i)}", {}))
+            for j in rest_b:
+                if j not in gepaart_b:
+                    funde.append((pfad, 2, "nur_in_b", f"{pb['attrs'][j][0]} bei {ort(wb, j)}{mit_teilen(kb, j)}", {}))
+    funde.sort(key=lambda f: (f[0], f[1]))
+    for pfad, _, art, text, extra in funde:
+        _eintrag(ab, art, pfad, text, **extra)
     return ab
 
 

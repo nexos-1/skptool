@@ -134,8 +134,39 @@ class _Buffer:
         return data + b"\0" * (-len(data) % 4)
 
 
-def _material_names(model, isc, textures: bool) -> list[dict]:
+def _colorize(mat, skp_mat, tex, tex_index, bake: bool, averages: dict) -> None:
+    """Getoente Textur (SketchUp "Colorize"): Parameter als extras fuer Blender (bridge.py baut daraus
+    die Anzeige, der Rueckweg schreibt sie wieder als Toenung). Je nach Ziel bleibt das Originalbild
+    (Blender) oder es kommt das nach SketchUps Verfahren getoente Bild hinein (bake=True, fuer
+    glTF-Betrachter; eingesetzt in write_instanced_glb)."""
+    from skptool import einfaerben
+
+    rgb = [int(c) for c in skp_mat.color[:3]]
+    ctype = int(skp_mat.colorize_type or 0)
+    extras = mat.setdefault("extras", {})
+    extras.update(skp_colorize_type=ctype, skp_colorize_rgb=rgb)
+    if tex_index not in averages:  # je Bild nur einmal dekodieren
+        ok = tex.data and _image_ok(tex.data)
+        averages[tex_index] = einfaerben.texture_average(tex.data) if ok else None
+    avg = averages[tex_index]
+    if avg is not None:
+        extras["skp_colorize_deltas"] = [round(v, 6) for v in einfaerben.colorize_deltas(avg, rgb, ctype)]
+    if bake:
+        mat["_bake"] = (tex_index, tuple(rgb), ctype)
+
+
+def _material_names(model, isc, textures: bool, bake_colorize: bool = False,
+                    fallback_names: bool = False) -> list[dict]:
+    """glTF-Materialliste mit SketchUp-Namen.
+
+    Namen kommen aus isc.skp_material_names (core.build_instanced_scene, je glTF-Material genau ein
+    SketchUp-Material). Fehlt die Liste (Szene direkt aus OpenSKP gebaut), wird wie frueher ueber
+    Textur und Farbe geraten, dann gewinnt bei gleicher Farbe das erste Material.
+    Unbemalte Flaechen heissen DEFAULT_MAT (extras skp_default), auch wenn OpenSKP ihnen die Farbe
+    einer bemalten Gruppe gegeben hat: den Namen der Bemalung setzt Blender ueber skp_paint am Knoten.
+    fallback_names=True (3MF): solche Flaechen heissen nach dem Material mit ihrer Farbe."""
     referenced = [mt for mt in model.materials if mt.id is not None]
+    by_name = {mt.name: mt for mt in referenced}
     by_rgb: dict = {}
     for mt in referenced:
         if mt.color:
@@ -144,36 +175,65 @@ def _material_names(model, isc, textures: bool) -> list[dict]:
     for mt in referenced:
         if mt.texture is not None and mt.texture.data:
             by_texture.setdefault(mt.texture.data, mt.name)
+    averages: dict = {}
+    known = getattr(isc, "skp_material_names", None)
+    if known is not None and len(known) != len(isc.gltf_materials):
+        known = None
     out = []
-    for gm in isc.gltf_materials:
+    for i, gm in enumerate(isc.gltf_materials):
         pbr = dict(gm["pbrMetallicRoughness"])
+        pbr["baseColorFactor"] = list(pbr["baseColorFactor"])
         tex_ref = pbr.pop("baseColorTexture", None)
         rgb = tuple(round(c * 255) for c in pbr["baseColorFactor"][:3])
-        name, is_default = None, False
+        mat: dict = {}
+        name, is_default, skp_mat = None, False, None
+        if known is not None and known[i] is not None:
+            skp_mat = by_name.get(known[i])
+            if skp_mat is not None:
+                name = skp_mat.name
         if tex_ref is not None:
             tex = isc.textures[tex_ref["index"]]
-            name = by_texture.get(tex.data) or Path(tex.filename or "Textur").stem
+            if name is None:
+                name = by_texture.get(tex.data) or Path(tex.filename or "Textur").stem
             if textures:
                 pbr["baseColorTexture"] = {"index": tex_ref["index"]}
+                # OpenSKP laesst die Materialfarbe als Faktor stehen, glTF (und Blender) multipliziert
+                # sie mit dem Bild. SketchUp zeigt das Bild aber unveraendert, die Farbe ist dort nur
+                # dessen Durchschnitt: mit Faktor wurde jede Textur deutlich dunkler. Alpha bleibt.
+                mat["extras"] = {"skp_color": list(rgb)}  # Farbe fuer Blenders Volltonansicht
+                pbr["baseColorFactor"] = [1.0, 1.0, 1.0, pbr["baseColorFactor"][3]]
+                if skp_mat is not None and skp_mat.colorized:
+                    _colorize(mat, skp_mat, tex, tex_ref["index"], bake_colorize, averages)
+        if name is None and known is not None and known[i] is None:
+            # unbemalte Flaeche: Farbe der bemalten Gruppe behalten, sonst SketchUps Standardfarbe
+            if fallback_names and rgb in by_rgb:
+                name = by_rgb[rgb]
+            else:
+                name, is_default = DEFAULT_MAT, True
+                if rgb not in by_rgb:
+                    pbr["baseColorFactor"] = list(DEFAULT_RGBA)
         if name is None:
             name = by_rgb.get(rgb)
         if name is None:
             name, is_default = DEFAULT_MAT, True
             pbr["baseColorFactor"] = list(DEFAULT_RGBA)
-        mat = {"name": name, "pbrMetallicRoughness": pbr}
+        mat.update(name=name, pbrMetallicRoughness=pbr)
         for key in ("doubleSided", "alphaMode"):
             if key in gm:
                 mat[key] = gm[key]
         if is_default:
-            mat["extras"] = {"skp_default": True}
+            mat.setdefault("extras", {})["skp_default"] = True
         out.append(mat)
     return out
 
 
-def write_instanced_glb(model, isc, instance_info: dict, glb_path: Path, textures: bool = True) -> dict:
-    """Schreibt die GLB. instance_info: {(pfad, x_mm, y_mm, z_mm): (ebene, bemalung)}."""
+def write_instanced_glb(model, isc, instance_info: dict, glb_path: Path, textures: bool = True,
+                        bake_colorize: bool = False) -> dict:
+    """Schreibt die GLB. instance_info: {(pfad, x_mm, y_mm, z_mm): (ebene, bemalung)}.
+    bake_colorize: getoente Texturen als fertig getoentes Bild (fuer glTF-Betrachter). Ohne bleibt
+    das Originalbild drin und die Toenung steht nur in den extras (Weg nach Blender)."""
     buf = _Buffer()
-    materials = _material_names(model, isc, textures)
+    materials = _material_names(model, isc, textures, bake_colorize=bake_colorize)
 
     images, gl_textures, dropped = [], [], set()
     if textures and isc.textures:
@@ -190,6 +250,25 @@ def write_instanced_glb(model, isc, instance_info: dict, glb_path: Path, texture
             ref = mat["pbrMetallicRoughness"].get("baseColorTexture")
             if ref is not None and ref["index"] in dropped:
                 del mat["pbrMetallicRoughness"]["baseColorTexture"]
+        baked: dict = {}  # (Texturindex, Farbe, Art) -> neuer Texturindex
+        for mat in materials:
+            key = mat.pop("_bake", None)
+            ref = mat["pbrMetallicRoughness"].get("baseColorTexture")
+            if key is None or ref is None:
+                continue
+            if key not in baked:
+                from skptool.einfaerben import colorized_png
+
+                png = colorized_png(isc.textures[key[0]].data, key[1], key[2])
+                if png is None:  # nicht umrechenbar: Originalbild behalten
+                    baked[key] = ref["index"]
+                else:
+                    images.append({"bufferView": buf.image(png), "mimeType": "image/png"})
+                    gl_textures.append({"source": len(images) - 1, "sampler": 0})
+                    baked[key] = len(gl_textures) - 1
+            ref["index"] = baked[key]
+    for mat in materials:
+        mat.pop("_bake", None)
 
     meshes, mesh_index = [], {}
     hard_edges = {}  # mesh-Schluessel -> float32-Liste (x1,y1,z1,x2,y2,z2)* in Blender-Metern
@@ -225,7 +304,11 @@ def write_instanced_glb(model, isc, instance_info: dict, glb_path: Path, texture
     stats = {"nodes": 0, "with_mesh": 0, "layers_fixed": 0, "sheared_split": 0}
 
     def emit(node, path: str) -> int:
-        name = node.name or node.definition_name or "Gruppe"
+        # OpenSKP 1.3.0 setzt fuer unbenannte Instanzen einen Ersatznamen ("Component_123",
+        # name_is_generated). skptool bleibt bei Instanzname, sonst Definitionsname: so heissen
+        # die Objekte in Blender wie bisher, und der Schluessel passt zu core._instance_info.
+        name = "" if getattr(node, "name_is_generated", False) else node.name
+        name = name or node.definition_name or "Gruppe"
         my_path = f"{path} / {name}"
         key = (my_path, *(round(v, 2) + 0.0 for v in node.position_mm))
         layer, paint = instance_info.get(key, (node.layer or "Layer0", None))

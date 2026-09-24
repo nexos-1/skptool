@@ -38,6 +38,46 @@ jobs:
           SKPTOOL_SKIP_GUI_TESTS: "1"
         run: python -m unittest discover -s tests -v
 
+  paket:
+    # pyproject.toml: Wheel bauen, in eine saubere venv installieren und den Befehl skptool pruefen,
+    # auch aus einem Ordner mit praeparierten Python-Dateien (der Starter ruft Python ohne -P auf).
+    name: Paket bauen und installieren
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Wheel bauen (setuptools nur mit Pruefsumme)
+        run: |
+          python -m venv "$RUNNER_TEMP/bau"
+          "$RUNNER_TEMP/bau/bin/python" -m pip install --require-hashes --no-deps -r tools/paketbau.lock
+          "$RUNNER_TEMP/bau/bin/python" -m pip wheel --no-build-isolation --no-deps -w "$RUNNER_TEMP/dist" .
+          ls -l "$RUNNER_TEMP/dist"
+      - name: In saubere venv installieren (Abhaengigkeiten nur mit Pruefsummen)
+        run: |
+          python -m venv "$RUNNER_TEMP/paket"
+          "$RUNNER_TEMP/paket/bin/python" -m pip install --require-hashes --no-deps -r requirements.lock
+          "$RUNNER_TEMP/paket/bin/python" -m pip install --no-deps "$RUNNER_TEMP"/dist/skptool-*.whl
+          echo "SKPTOOL_INSTALLIERT=$RUNNER_TEMP/paket/bin/skptool" >> "$GITHUB_ENV"
+      - name: Befehl skptool aus fremdem Ordner
+        run: |
+          mkdir -p "$RUNNER_TEMP/fremd/skptool"
+          for m in numpy json re glob argparse; do echo "raise SystemExit('$m.py aus dem aktuellen Ordner geladen')" > "$RUNNER_TEMP/fremd/$m.py"; done
+          echo "raise SystemExit('skptool aus dem aktuellen Ordner geladen')" > "$RUNNER_TEMP/fremd/skptool/__init__.py"
+          cp samples/stuhl_tisch_2017.skp "$RUNNER_TEMP/fremd/"
+          cd "$RUNNER_TEMP/fremd"
+          "$SKPTOOL_INSTALLIERT" --version
+          "$SKPTOOL_INSTALLIERT" info stuhl_tisch_2017.skp
+          "$SKPTOOL_INSTALLIERT" convert stuhl_tisch_2017.skp -o stuhl.glb
+          test -s stuhl.glb
+      - name: Paket-Tests gegen den installierten Befehl
+        # Python der Paket-venv (hat die Abhaengigkeiten); die Tests selbst kommen aus dem Checkout
+        run: '"$RUNNER_TEMP/paket/bin/python" -m unittest tests.test_paket -v'
+
   blender-linux:
     # Dieselbe Blender-Version wie lokal (5.2.0 LTS), per SHA-256 geprueft. Fenster-Tests bleiben aus.
     name: Mit Blender 5.2.0 auf Linux

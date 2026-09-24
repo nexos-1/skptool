@@ -45,11 +45,11 @@ GUI_OK = BLENDER is not None and not os.environ.get("SKPTOOL_SKIP_GUI_TESTS")
 class Client:
     """Startet python -m skptool mcp und spricht JSON-RPC ueber stdin/stdout."""
 
-    def __init__(self, *server_args, env=None, cwd=ROOT):
+    def __init__(self, *server_args, env=None, cwd=ROOT, basis_env=None):
         self.stderr = tempfile.TemporaryFile()
         self.proc = subprocess.Popen([sys.executable, "-m", "skptool", "mcp", *server_args], cwd=cwd,
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
-                                     env={**os.environ, **(env or {})})
+                                     env={**(os.environ if basis_env is None else basis_env), **(env or {})})
         self.zeilen = queue.Queue()
         self.roh: list[bytes] = []
         self.rid = 0
@@ -145,11 +145,14 @@ class TestProtokoll(unittest.TestCase):
         self.assertEqual(r["capabilities"], {"tools": {}})
         self.assertEqual(r["serverInfo"]["name"], "skptool")
         self.assertIn("serverInfo", r)
-        # bekannte aeltere Version wird uebernommen, unbekannte bekommt die Standardversion
+        # bekannte aeltere Version wird uebernommen; auf eine unbekannte (aeltere wie neuere) antwortet der
+        # Server laut Spezifikation mit der neuesten, die er kann
         self.assertEqual(self.c.anfrage("initialize", {"protocolVersion": "2024-11-05"})["result"]["protocolVersion"],
                          "2024-11-05")
-        self.assertEqual(self.c.anfrage("initialize", {"protocolVersion": "1999-01-01"})["result"]["protocolVersion"],
-                         "2025-06-18")
+        for unbekannt in ("1999-01-01", "2026-07-28", "2099-12-31", None, 5):
+            r = self.c.anfrage("initialize", {"protocolVersion": unbekannt})["result"]
+            self.assertEqual(r["protocolVersion"], "2025-11-25", unbekannt)
+        self.assertEqual(mcp_server.PROTOKOLL_STANDARD, mcp_server.PROTOKOLLE[0])
 
     def test_02_ping(self):
         self.assertEqual(self.c.anfrage("ping")["result"], {})
@@ -234,7 +237,12 @@ class TestProtokoll(unittest.TestCase):
         self.c.senden([{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
         self.assertEqual(self.c.empfangen()["error"]["code"], -32600)
         self.c.senden({"jsonrpc": "1.0", "id": 1, "method": "ping"})
-        self.assertEqual(self.c.empfangen()["error"]["code"], -32600)
+        r = self.c.empfangen()
+        self.assertEqual(r["error"]["code"], -32600)
+        self.assertEqual(r["id"], 1)  # die id ist erkennbar: der Client kann den Fehler zuordnen
+        self.c.senden({"jsonrpc": "2.0", "id": 1.5, "method": "ping"})  # MCP: id nur Text oder ganze Zahl
+        r = self.c.empfangen()
+        self.assertEqual((r["error"]["code"], r["id"]), (-32600, None))
         self.c.senden({"jsonrpc": "2.0", "id": None, "method": "ping"})
         self.assertEqual(self.c.empfangen()["error"]["code"], -32600)
         self.c.roh_senden(b"\n\r\n")  # Leerzeilen werden still uebergangen
@@ -327,6 +335,20 @@ class TestProtokoll(unittest.TestCase):
         self.assertIn("gibt es schon", text_of(r))
         self.assertEqual(ziel.read_bytes(), vorher)
         self.assertEqual([p.name for p in self.tmp.iterdir() if "skptool-tmp" in p.name], [])
+        # 3MF fuer den 3D-Druck: eine einzelne ZIP-Datei, ohne Blender
+        ziel3 = self.tmp / "stuhl.3mf"
+        r = self.c.call("skp_convert", {"input": str(S2017), "output": str(ziel3)})
+        self.assertFalse(r["isError"], text_of(r))
+        self.assertTrue(ziel3.read_bytes().startswith(b"PK\x03\x04"))
+        ziel3.unlink()
+        # .3mf nur aus .skp und ohne ops: klare Meldung, bevor Blender arbeitet
+        r = self.c.call("skp_convert", {"input": str(ziel), "output": str(ziel3)})
+        self.assertTrue(r["isError"])
+        self.assertIn(".3mf entsteht nur aus einer .skp-Datei", text_of(r))
+        r = self.c.call("skp_edit", {"input": str(S2017), "output": str(ziel3), "ops": [{"op": "summary"}]})
+        self.assertTrue(r["isError"])
+        self.assertIn("nicht zusammen mit ops", text_of(r))
+        self.assertFalse(ziel3.exists())
         # skp -> skp (2017-Format) ohne Blender
         ziel2 = self.tmp / "stuhl_neu.skp"
         r = self.c.call("skp_convert", {"input": str(S2017), "output": str(ziel2)})
@@ -399,6 +421,117 @@ class TestServerSchalter(unittest.TestCase):
         c = Client()
         c.init()
         self.assertEqual(c.schliessen(), 0)
+
+
+class TestKonformitaet(unittest.TestCase):
+    """Befunde aus der Pruefung mit dem MCP Inspector und dem offiziellen Python-SDK
+    (tools/mcp_sdk_pruefung.py), hier ohne SDK nachgestellt."""
+
+    def test_discover_probe_falls_back(self):
+        # Clients ab Protokoll 2026-07-28 fragen zuerst server/discover; "Methode unbekannt" mit
+        # derselben id laesst sie auf initialize zurueckfallen
+        c = Client()
+        try:
+            r = c.anfrage("server/discover", {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}})
+            self.assertEqual(r["error"]["code"], -32601)
+            self.assertEqual(c.init("2025-11-25")["result"]["protocolVersion"], "2025-11-25")
+        finally:
+            c.schliessen()
+
+    def test_batch_only_with_2025_03_26(self):
+        c = Client()
+        try:
+            c.senden([{"jsonrpc": "2.0", "id": 1, "method": "ping"}])  # vor initialize: kein Batch
+            self.assertEqual(c.empfangen()["error"]["code"], -32600)
+            c.init("2025-06-18")
+            c.senden([{"jsonrpc": "2.0", "id": 2, "method": "ping"}])
+            r = c.empfangen()
+            self.assertEqual((r["error"]["code"], r["id"]), (-32600, None))
+            self.assertIn("2025-03-26", r["error"]["message"])
+        finally:
+            c.schliessen()
+
+    def test_batch_with_2025_03_26(self):
+        # 2025-03-26 verlangt: Batches empfangen koennen, Antworten als ein Array
+        c = Client()
+        try:
+            c.init("2025-03-26")
+            c.senden([{"jsonrpc": "2.0", "id": "a", "method": "ping"},
+                      {"jsonrpc": "2.0", "method": "notifications/irgendwas"},
+                      {"jsonrpc": "2.0", "id": "b", "method": "tools/call",
+                       "params": {"name": "skp_info", "arguments": {"path": str(S2017)}}},
+                      {"jsonrpc": "2.0", "id": "c", "method": "gibtsnicht"},
+                      {"jsonrpc": "2.0", "id": "d", "method": "tools/call",
+                       "params": {"name": "skp_info", "arguments": {}}},
+                      {"jsonrpc": "2.0", "id": "e", "method": "initialize", "params": {}},
+                      7])
+            r = c.empfangen(timeout=300)
+            self.assertIsInstance(r, list)
+            nach_id = {m["id"]: m for m in r}
+            self.assertEqual(set(nach_id), {"a", "b", "c", "d", "e", None})
+            self.assertEqual(nach_id["a"]["result"], {})
+            self.assertFalse(nach_id["b"]["result"]["isError"])
+            self.assertEqual(nach_id["b"]["result"]["structuredContent"]["version"], "17.0.1")
+            self.assertEqual(nach_id["c"]["error"]["code"], -32601)
+            self.assertTrue(nach_id["d"]["result"]["isError"])
+            self.assertEqual(nach_id["e"]["error"]["code"], -32600)  # initialize nie im Batch
+            self.assertEqual(nach_id[None]["error"]["code"], -32600)  # 7 ist keine Anfrage
+            # nur Benachrichtigungen: keine Antwort; leerer Batch: ein einzelner Fehler
+            c.senden([{"jsonrpc": "2.0", "method": "notifications/initialized"}])
+            c.senden([])
+            r = c.empfangen()
+            self.assertEqual((r["error"]["code"], r["id"]), (-32600, None))
+            c.senden([{"jsonrpc": "2.0", "id": i, "method": "ping"} for i in range(mcp_server.MAX_STAPEL + 1)])
+            self.assertEqual(c.empfangen()["error"]["code"], -32600)
+            # ein abgebrochener Aufruf fehlt im Batch-Array, der Rest kommt
+            c.senden([{"jsonrpc": "2.0", "id": "lang", "method": "tools/call",
+                       "params": {"name": "skp_diff", "arguments": {"a": str(S2017), "b": str(S2017),
+                                                                     "geometrie": True}}},
+                      {"jsonrpc": "2.0", "id": "kurz", "method": "ping"}])
+            c.senden({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "lang"}})
+            r = c.empfangen(timeout=120)
+            self.assertEqual([m["id"] for m in r], ["kurz"])
+            self.assertEqual(c.anfrage("ping")["result"], {})
+        finally:
+            self.assertEqual(c.schliessen(), 0)
+        for zeile in c.roh:
+            self.assertTrue(zeile.isascii() and zeile.endswith(b"\n") and zeile.count(b"\n") == 1)
+
+    def test_stderr_is_utf8(self):
+        # stdio-Transport: Meldungen auf stderr als UTF-8, auch bei einer anderen Codepage (cli.main
+        # stellt stderr um; dieser Test haelt das fest)
+        basis = {k: v for k, v in os.environ.items() if k.upper() not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+        c = Client(basis_env=basis, env={"PYTHONIOENCODING": "cp1252"})
+        try:
+            c.anfrage("initialize", {"protocolVersion": "2025-11-25",
+                                     "clientInfo": {"name": "Pr\u00fcfer \u2713 \u6d4b\u8bd5", "version": "1"}})
+            c.proc.stdin.close()
+            c.proc.wait(30)
+            c.stderr.seek(0)
+            log = c.stderr.read()
+        finally:
+            self.assertEqual(c.schliessen(), 0)
+        self.assertIn("Pr\u00fcfer \u2713 \u6d4b\u8bd5", log.decode("utf-8"))
+
+    @unittest.skipUnless(os.name == "nt", "nur Windows")
+    def test_worker_env_gets_known_folders(self):
+        # Clients wie das Python-SDK geben kein ProgramFiles weiter: ohne Ergaenzung faende der
+        # Arbeitsprozess Blender nicht (so im SDK-Lauf gefunden)
+        server = mcp_server.Server(None, None)
+        alt = dict(os.environ)
+        try:
+            for k in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+                os.environ.pop(k, None)
+            env = server._umgebung()
+        finally:
+            os.environ.clear()
+            os.environ.update(alt)
+        self.assertTrue(os.path.isabs(env["PROGRAMFILES"]) and os.path.isdir(env["PROGRAMFILES"]))
+        self.assertTrue(os.path.isdir(env["LOCALAPPDATA"]))
+        # vorhandene Werte bleiben, wie sie sind
+        env = {"PROGRAMFILES": r"D:\Eigene Programme"}
+        mcp_server._windows_ordner_ergaenzen(env)
+        self.assertEqual(env["PROGRAMFILES"], r"D:\Eigene Programme")
 
 
 class TestHilfsfunktionen(unittest.TestCase):

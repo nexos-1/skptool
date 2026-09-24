@@ -4,3 +4,5 @@
 *.blend binary
 *.glb binary
 *.cmd text eol=crlf
+*.sh text eol=lf
+*.Dockerfile text eol=lf

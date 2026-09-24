@@ -1,5 +1,10 @@
-# Alle Versionen sind am 2026-09-22 mindestens 14 Tage alt (Supply-Chain-Regel).
-openskp==1.2.0        # 2026-09-04, MIT, Clean-Room-Parser/Writer fuer .skp
+# Alle Versionen sind am 2026-09-23 mindestens 14 Tage alt (Supply-Chain-Regel), mit einer
+# Ausnahme: openskp 1.3.0 (2026-09-18, 5 Tage) auf ausdrueckliche Freigabe des Eigentuemers
+# (2026-09-23), nach Pruefung von Wheel und sdist (SHA-256 wie auf PyPI, Wheel gleich dem
+# GitHub-Tag python-v1.3.0, Quellcode-Diff 1.2.0 -> 1.3.0 gelesen).
+openskp==1.3.0        # 2026-09-18, MIT, Clean-Room-Parser/Writer fuer .skp (Ausnahme, siehe oben)
+mapbox-earcut==2.1.0  # 2026-09-08, ISC, von openskp 1.3.0 benoetigt (Triangulierung, kompiliert,
+                      # Trusted Publishing aus github.com/skogler/mapbox_earcut_python)
 pillow==12.3.0        # 2026-07-01, fuer eingebettete Texturen
 numpy==2.5.3          # 2026-09-06
 trimesh==5.1.0        # 2026-08-31

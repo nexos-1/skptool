@@ -74,4 +74,23 @@ def load_ops(raw: str, stdin=None) -> list:
         raise SystemExit(f"--ops braucht eine Liste wie {EXAMPLE}")
     if len(data) > MAX_OPS:
         raise SystemExit(f"--ops: hoechstens {MAX_OPS} Operationen ({len(data)} angegeben)")
+    _pruefe_endlich(data)
     return data
+
+
+def _pruefe_endlich(node, tiefe: int = 0) -> None:
+    """Nicht endliche Zahlen ablehnen. parse_constant faengt nur die Woerter NaN/Infinity ab,
+    nicht einen Ueberlauf wie 1e400, der still zu inf wird. Die feste Liste von Operationen prueft
+    das spaeter noch einmal, aber --ops soll gar nicht erst inf/nan durchreichen."""
+    if tiefe > 64:
+        raise SystemExit("--ops ist zu tief verschachtelt")
+    if isinstance(node, float):
+        import math
+        if not math.isfinite(node):
+            raise SystemExit("--ops enthaelt eine nicht endliche Zahl (inf/nan), das ist nicht erlaubt")
+    elif isinstance(node, dict):
+        for v in node.values():
+            _pruefe_endlich(v, tiefe + 1)
+    elif isinstance(node, list):
+        for v in node:
+            _pruefe_endlich(v, tiefe + 1)
