@@ -19,7 +19,8 @@ Nicht Teil dieses Repositorys, installiert über `requirements.lock`:
 
 | Paket | Lizenz |
 |---|---|
-| openskp 1.2.0 | MIT |
+| openskp 1.3.0 | MIT |
+| mapbox-earcut 2.1.0 (Python-Bindung, enthält mapbox/earcut.hpp) | ISC |
 | pillow | MIT-CMU |
 | numpy | BSD-3-Clause (enthält weitere freie Lizenzen) |
 | trimesh | MIT |

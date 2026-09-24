@@ -89,7 +89,7 @@ def cmd_info(a) -> int:
         try:
             data = core.info(p, with_bounds=bounds)
         except Exception as exc:
-            print(f"FEHLER {p}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(f"FEHLER {p}: {_explain(p, exc, False)}", file=sys.stderr)
             rc = 1
             continue
         if a.json:
@@ -212,6 +212,8 @@ def convert_one(src: Path, dst: Path, a) -> str:
             if d_ext == ".skp":
                 step(_read_hint(src) + " und schreibe sie im 2017-Format neu")
                 st = core.rewrite_legacy(src, dst)
+                for zeile in st.get("verluste", []):  # je verlorener Art eine Zeile, wie in skptool report
+                    print(f"Hinweis {src.name}: {zeile}", file=sys.stderr)
                 return (f"als SketchUp-2017-Datei geschrieben ({st['version']}), "
                         f"{st['faces_written']} von {st['faces_source']} Flaechen, "
                         f"{st['triangulated']} trianguliert, {st['skipped']} uebersprungen, "
@@ -238,7 +240,9 @@ def convert_one(src: Path, dst: Path, a) -> str:
                              blender=a.blender, verbose=a.verbose)
             _report_external(res["stats"], a)
             _remember_ops(a, res["stats"])
-            scale = 1.0 / a.unit_scale if a.unit_scale else None
+            # Blender-Einheit -> Zoll: Meter pro Einheit durch Meter pro Zoll (vorher 1/unit_scale, damit
+            # wurde --unit-scale 1.0 zu "1 Einheit = 1 Zoll" statt 1 Meter)
+            scale = a.unit_scale / core.INCH if a.unit_scale else None
             step(f"Schreibe {dst.name}")
             st = core.write_skp_from_bin(header, dst, scale_to_inch=scale, textures=textures, reparse=False)
             size_mb = dst.stat().st_size / 2**20
@@ -265,13 +269,37 @@ def convert_one(src: Path, dst: Path, a) -> str:
 def _explain(src: Path, exc: Exception, verbose: bool) -> str:
     """Fehler verstaendlich einordnen; technische Details (Hex-Auszuege) nur mit -v."""
     name, msg = type(exc).__name__, str(exc)
+    if name == "BlenderError":
+        # Eine Zeile ohne Klassennamen: run_bridge setzt den Grund in eine zweite Zeile, und ohne
+        # Ergebniszeile stehen dort die letzten Zeilen der Blender-Ausgabe (auch ein Traceback).
+        zeilen = [z.strip() for z in msg.splitlines() if z.strip()]
+        kopf = "Blender-Schritt fehlgeschlagen:"
+        if zeilen and zeilen[0] == kopf:
+            rest = zeilen[1:]
+            if any(z.startswith("Traceback") for z in rest) or len(rest) > 3:
+                rest = rest[-1:]  # die eigentliche Meldung steht zuletzt, alles mit -v
+            return f"{kopf} {' '.join(rest)}" if rest else kopf
+        return " ".join(zeilen)
+    # Typische Folgen kaputter Daten beim Lesen (fehlender Eintrag, Index hinter dem Ende, ungueltiger
+    # Text): ohne englischen Ausnahmenamen melden. Echte Programmfehler (AttributeError, TypeError)
+    # bleiben sichtbar.
+    beschaedigt = ("KeyError", "IndexError", "UnicodeDecodeError", "OverflowError", "EOFError", "NotImplementedError")
+    if src.suffix.lower() == ".skp" and name in beschaedigt:
+        try:
+            version = core.header_version(src)
+        except (OSError, ValueError):
+            return "keine SketchUp-Datei (Dateikopf fehlt)"
+        detail = f" Technisch: {name}: {msg}" if verbose else " Details mit -v."
+        return f"Datei ist beschaedigt oder unvollstaendig (Version {version}).{detail}"
     if src.suffix.lower() == ".skp" and name in ("SkpParseError", "BadZipFile", "error", "ValueError"):
         try:
             version = core.header_version(src)
         except ValueError:
             return "keine SketchUp-Datei (Dateikopf fehlt)"
         detail = f" Technisch: {name}: {msg}" if verbose else " Details mit -v."
-        if name in ("BadZipFile", "error") or "truncat" in msg.lower() or "unexpected end" in msg.lower():
+        # "requires a buffer ..." / "unpack": struct lief ueber das Dateiende (abgeschnittene Datei)
+        kaputt = ("truncat", "unexpected end", "requires a buffer", "unpack")
+        if name in ("BadZipFile", "error") or any(k in msg.lower() for k in kaputt):
             return f"Datei ist beschaedigt oder unvollstaendig (Version {version}).{detail}"
         if name == "SkpParseError":
             return (f"OpenSKP kann diese Datei (Version {version}) nicht lesen. Bei aelteren Versionen hilft "
@@ -406,33 +434,66 @@ def _check_before_window(src: Path, a) -> int:
     return 0
 
 
+def _pruefe_vorhandene_blend(src: Path, blend: Path, force: bool) -> str:
+    """Eine vorhandene .blend, die neuer ist als die Eingabe, enthaelt vermutlich Aenderungen aus
+    Blender: nicht still ueberschreiben. Rueckgabe: Hinweis, welche Datei erzeugt wird."""
+    if not blend.exists():
+        return f"Erzeuge {blend} aus {src.name}"
+    if blend.is_dir():
+        raise SystemExit(f"{blend} ist ein Ordner. Nichts geschrieben.")
+    if blend.stat().st_mtime < src.stat().st_mtime:
+        return f"Erzeuge {blend} neu aus {src.name} (die vorhandene .blend ist aelter als {src.name})"
+    if force:
+        return f"Erzeuge {blend} neu aus {src.name} (--force: die vorhandene, neuere .blend wird ersetzt)"
+    raise SystemExit(f"{blend} gibt es schon und ist neuer als {src.name}. Sie enthaelt vermutlich Aenderungen "
+                     f"aus Blender, die beim Neu-Erzeugen verloren gingen. Nichts geschrieben.\n"
+                     f'  Die vorhandene Datei oeffnen: skptool open "{blend}"\n'
+                     f"  Aus {src.name} neu erzeugen und {blend.name} ueberschreiben: --force")
+
+
 def cmd_open(a) -> int:
+    # Erst alle Pruefungen, dann schreiben: nichts darf eine Datei anlegen oder ueberschreiben,
+    # bevor feststeht, dass Blender auch wirklich startet.
     src = _expand([a.input])[0]
+    ist_blend = src.suffix.lower() == ".blend"
     if a.export_skp and not a.live:
         raise SystemExit("--export-skp geht nur zusammen mit --live")
+    if ist_blend:
+        if a.output:
+            raise SystemExit("-o geht nur beim Umwandeln einer anderen Datei, eine .blend wird direkt geoeffnet")
+        if a.ops:
+            raise SystemExit("--ops geht beim Oeffnen nur beim Umwandeln einer anderen Datei. Eine .blend "
+                             "bearbeiten: skptool edit oder skptool open ... --live mit skptool live --ops")
+        blend, hinweis = src, None
+    else:
+        blend = Path(a.output) if a.output else src.with_suffix(".blend")
+        if blend.suffix.lower() != ".blend":
+            raise SystemExit(f"-o muss eine .blend-Datei sein, nicht {blend.name}. Nichts geschrieben.")
+        if _same_file(blend, src):
+            raise SystemExit(f"Ziel und Quelle sind dieselbe Datei: {src}")
+        hinweis = _pruefe_vorhandene_blend(src, blend, getattr(a, "force", False))
+    target = None
     if a.live:
         from skptool import live
+        target = live.export_target(src, blend, a)
         try:
             live.ensure_free()  # vor der langen Umwandlung pruefen, ob schon eines laeuft
         except live.LiveError as exc:
-            print(f"FEHLER: {exc}", file=sys.stderr)
+            print(f"FEHLER: {exc} Nichts geschrieben.", file=sys.stderr)
             return 1
-    if src.suffix.lower() == ".blend":
-        blend = src
-        if a.output:
-            raise SystemExit("-o geht nur beim Umwandeln einer anderen Datei, eine .blend wird direkt geoeffnet")
+    if ist_blend:
         rc = _check_before_window(src, a)  # das Fenster laedt die Datei ohne unsere Pruefung
         if rc:
             return rc
     else:
-        blend = Path(a.output) if a.output else src.with_suffix(".blend")
+        print(hinweis, flush=True)
         a.inputs, a.format, a.outdir = [str(src)], None, None
         a.output = str(blend)
         rc = cmd_convert(a)
         if rc:
             return rc
     if a.live:
-        return live.open_live(src, blend, a)
+        return live.open_live(src, blend, a, target)
     launch_gui(str(blend.resolve()), blender=a.blender)
     print(f"Blender startet mit {blend}. Nach dem Bearbeiten speichern und zurueck mit:")
     print(f'  skptool convert "{blend}" -o "{src.with_name(src.stem + "_bearbeitet.skp")}"')
@@ -526,6 +587,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--export-skp", metavar="ZIEL",
                    help="Mit --live: diese .skp nach jedem Speichern schreiben "
                         "(Standard bei .skp-Eingabe: <name>_bearbeitet.skp, nie das Original)")
+    p.add_argument("--force", action="store_true",
+                   help="Eine vorhandene .blend auch dann neu erzeugen, wenn sie neuer ist als die Eingabe "
+                        "(Aenderungen darin gehen verloren)")
     p.set_defaults(func=cmd_open)
 
     from skptool import live

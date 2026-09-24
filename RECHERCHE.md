@@ -50,7 +50,7 @@ Twinmotion und D5 Render importieren `.skp`, exportieren aber keine Geometrie. C
 ## 4. Blender-Add-ons im Detail
 
 - **RedHaloStudio/Sketchup_Importer 0.27.0** (Januar 2026) ist das verbreitete Import-Add-on. Es nutzt das offizielle Trimble-SDK, läuft laut Projekt unter Windows und macOS und unterstützt Blender 5.1 und 5.2 sowie Dateien bis SketchUp 2026. Nach den ausgewerteten Quellen importiert es, exportiert aber nicht. Hier nicht selbst getestet.
-- **blender-openskp 0.2.5** vom Autor von OpenSKP importiert und exportiert ohne SDK, auch unter Linux. Es bündelt OpenSKP 1.3.0, das zum Zeitpunkt der Recherche erst wenige Tage alt war. Mit der älteren OpenSKP-Version 1.2.0 bricht der Import ab. `skptool` verwendet nur Paketversionen, die mindestens 14 Tage veröffentlicht sind, und nutzt es deshalb nicht.
+- **blender-openskp 0.2.5** vom Autor von OpenSKP importiert und exportiert ohne SDK, auch unter Linux. Es bündelt OpenSKP 1.3.0, das zum Zeitpunkt der Recherche erst wenige Tage alt war. Mit der älteren OpenSKP-Version 1.2.0 bricht der Import ab. `skptool` verwendet nur Paketversionen, die mindestens 14 Tage veröffentlicht sind, und nutzte deshalb zunächst 1.2.0. OpenSKP 1.3.0 hat es erst nach Prüfung von Paket und Quellcode als ausdrückliche Ausnahme übernommen. Das Add-on selbst nutzt `skptool` nicht.
 - **Skp Editor** auf Superhive kostet 16 $ und kann laut Anbieter Import und Export mit Texturen. Nicht getestet.
 - Auf extensions.blender.org gibt es noch kein SketchUp-Add-on. blender-openskp wartet dort auf Freigabe.
 
@@ -63,19 +63,21 @@ Twinmotion und D5 Render importieren `.skp`, exportieren aber keine Geometrie. C
 
 ## 6. Entscheidung für die CLI
 
-Gebaut wurde `skptool` auf **OpenSKP 1.2.0 plus Blender**:
+Gebaut wurde `skptool` auf **OpenSKP plus Blender** (anfangs OpenSKP 1.2.0, inzwischen 1.3.0):
 
 - OpenSKP liest alle getesteten Versionen und schreibt `.skp`. Es ist MIT-lizenziert und läuft ohne SketchUp und ohne SDK.
 - Blender liefert die Bearbeitung und Formate wie FBX, USD und `.blend`. Es läuft dafür im Hintergrund ohne Fenster.
 - Das Trimble-SDK wurde verworfen, weil es schwer erhältlich ist und seine Bedingungen nicht zu einem offenen Werkzeug passen.
 
-Beim Bau wurden fünf Probleme in OpenSKP 1.2.0 gefunden und in `skptool` umgangen:
+Beim Bau mit OpenSKP 1.2.0 wurden fünf Probleme gefunden und in `skptool` umgangen:
 
 1. Die eingebaute automatische Triangulierung schreibt Dateien, die der eigene Leser nicht mehr öffnet. `skptool` trianguliert deshalb selbst.
 2. Die Bearbeitungsfunktion lehnt Dateien ab 2021 ab. `skptool` nutzt dieselbe Daten-Wiedergabe ohne diese Sperre.
 3. Beim Umschreiben ging die Deckkraft verloren, Glas wurde undurchsichtig.
 4. Bei Dateien vor 2021 fehlen im Szenenaufbau die Ebenen und die Bemalung von Gruppen, obwohl der Leser sie kennt.
 5. Unbemalte Flächen bekommen die Ebenenfarbe statt der SketchUp-Standardfarbe, und Vorder- und Rückseite kommen als doppelte Flächen.
+
+Mit OpenSKP 1.3.0 bleiben die eigene Triangulierung (die neue mit earcut legt bei einem Testmodell 447 Dreiecke ohne Fläche an) und die Ergänzung von Ebenen und Gruppenbemalung im Szenenaufbau nötig. Der eigene Ersatz der Texturbasis entfällt, weil der Writer seit 1.3.0 dieselbe Texturbasis wie der Leser nutzt.
 
 Diese Punkte sollen als Hinweise an das OpenSKP-Projekt gehen.
 

@@ -1,0 +1,65 @@
+# Paketbeschreibung fuer pipx, uv tool und pip (PEP 621). Noch nicht auf PyPI.
+# Installation direkt aus dem Repository: pipx install git+https://github.com/nexos-1/skptool
+# Lieferkette: setuptools 84.0.0 ist vom 2026-08-08 (mindestens 14 Tage alt), die Pruefsummen stehen in
+# tools/paketbau.lock (uv build --build-constraints tools/paketbau.lock --require-hashes). Die
+# Abhaengigkeiten sind dieselben festen Versionen wie in requirements.txt (tests/test_paket.py prueft
+# das). Wer auch dafuer Pruefsummen will, installiert wie bisher aus requirements.lock.
+
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skptool"
+dynamic = ["version"]
+description = "SketchUp-Dateien (.skp) ohne SketchUp lesen, umwandeln, in Blender bearbeiten und zurueckschreiben"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "skptool contributors" }]
+keywords = ["sketchup", "skp", "blender", "gltf", "3mf", "converter", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Natural Language :: German",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
+dependencies = [
+    "openskp==1.3.0",
+    "mapbox-earcut==2.1.0",
+    "pillow==12.3.0",
+    "numpy==2.5.3",
+    "trimesh==5.1.0",
+    "shapely==2.1.2",
+    "defusedxml==0.7.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/nexos-1/skptool"
+Repository = "https://github.com/nexos-1/skptool"
+Issues = "https://github.com/nexos-1/skptool/issues"
+Changelog = "https://github.com/nexos-1/skptool/blob/main/CHANGELOG.md"
+Security = "https://github.com/nexos-1/skptool/blob/main/SECURITY.md"
+
+[project.scripts]
+skptool = "skptool.cli:main"
+
+[tool.setuptools]
+# Nur das Paket selbst. blender_scripts hat keine __init__.py (die Skripte laufen in Blender und werden
+# zur Laufzeit ueber ihren Pfad geladen), wird hier aber ausdruecklich als Paket genannt, damit die
+# .py-Dateien im Wheel landen. tests/, samples/, tools/ und docs/ gehoeren nicht ins Paket.
+packages = ["skptool", "skptool.blender_scripts"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+"skptool.blender_scripts" = ["*.py"]
+
+[tool.setuptools.dynamic]
+version = { attr = "skptool.__version__" }

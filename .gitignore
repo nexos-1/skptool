@@ -10,9 +10,22 @@ ergebnisse/
 /*.glb
 /*.fbx
 *.skp.skptool-tmp
+# gebaute Blender-Erweiterung (tools/extension_bauen.py)
+/dist/
 
 # Testdateien mit Inhalten Dritter, per tools/beispiele_laden.py
 samples/extern/
 
 # lokale Claude-Arbeitsordner (Worktrees der Agenten)
 .claude/
+
+# Paketbau (uv build, pip wheel)
+dist/
+build/
+*.egg-info/
+
+# Neben-venvs fuer Pruefungen (z. B. .venv-mcp mit dem MCP-SDK fuer tools/mcp_sdk_pruefung.py)
+.venv-*/
+
+# Pruefwerkzeuge (Slicer, Spezifikationen) fuer optionale Tests
+.werkzeuge/

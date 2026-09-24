@@ -1,0 +1,29 @@
+schema_version = "1.0.0"
+
+# SketchUp-Import und -Export ueber ein installiertes skptool (https://github.com/nexos-1/skptool).
+# Die Erweiterung enthaelt kein OpenSKP und keine Abhaengigkeiten, sie startet skptool als eigenen Prozess.
+id = "skptool_io"
+version = "0.1.0"
+name = "SketchUp (.skp) via skptool"
+tagline = "Import and export SketchUp files with an installed skptool"
+maintainer = "skptool contributors"
+type = "add-on"
+website = "https://github.com/nexos-1/skptool"
+tags = ["Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:MIT",
+]
+
+# Nur Dateizugriff, kein Netzwerk
+[permissions]
+files = "Import/export SketchUp files and run the local skptool"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/*.zip",
+]

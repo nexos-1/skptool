@@ -134,6 +134,43 @@ class TestNativeExport(Base):
         self.assertTrue((self.tmp / "x.glb").read_bytes().startswith(b"glTF"))
         self.assertIn("IFC4", (self.tmp / "x.ifc").read_text(errors="ignore")[:2000])
 
+    def test_glb_names_layers_and_paint_of_unnamed_instances(self):
+        """Unbenannte Instanzen: OpenSKP 1.3.0 nennt sie "Component_<n>" oder nach der Definition.
+        skptool bleibt bei Instanzname, sonst Definitionsname (auch "Group#1"), und Ebene sowie
+        Bemalung (bei Dateien vor 2021 von skptool ergaenzt) gehen dabei nicht verloren."""
+        b = core.create()
+        mat = b.add_material("Rot", [200, 0, 0, 255])
+        lay = b.add_layer("Rahmen")
+        with b.add_component_definition("Group#1") as g:
+            g.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0)])
+        with b.add_component_definition("Tisch") as t:
+            t.add_face([(0, 0, 0), (10, 0, 0), (10, 0, 10)])
+        b.add_instance(g, translation=(10, 0, 0), layer=lay, material=mat, name="")
+        b.add_instance(g, translation=(30, 0, 0), name="")
+        b.add_instance(t, translation=(50, 0, 0), layer=lay, name="")
+        b.add_instance(t, translation=(70, 0, 0), name="Links")
+        src = self.tmp / "gruppen.skp"
+        core.save_atomic(b, src)
+        out = self.tmp / "gruppen.glb"
+        core.export_native(core.open_skp(src), out)
+        data = out.read_bytes()
+        gltf = json.loads(data[20:20 + int.from_bytes(data[12:16], "little")])
+        got = sorted((n["name"], n["extras"]["skp_layer"], n["extras"].get("skp_paint")) for n in gltf["nodes"])
+        self.assertEqual(got, [("Group#1", "Layer0", None), ("Group#1", "Rahmen", "Rot"),
+                               ("Links", "Layer0", None), ("Tisch", "Rahmen", None)])
+
+    def test_ifc_is_millimetres_z_up(self):
+        """Seit OpenSKP 1.3.0: IFC-Koordinaten in Millimetern (wie die erklaerte Einheit) und Z oben.
+        Vorher standen dort Zoll-Werte unter der Einheit mm, das Modell lag auf der Seite."""
+        out = self.tmp / "stuhl.ifc"
+        core.export_native(core.open_skp(S2017), out)
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.)", text)
+        pts = [tuple(float(v) for v in m.group(1).split(","))
+               for m in re.finditer(r"\((-?[\d.eE+-]+,-?[\d.eE+-]+,-?[\d.eE+-]+)\)", text)]
+        z = [p[2] for p in pts]
+        self.assertAlmostEqual(max(z) - min(z), 864.0, delta=1.0)  # Tischhoehe 0,864 m
+
     def test_batch_with_format_and_outdir(self):
         code, text = run_cli("convert", str(SAMPLES / "*_20*.skp"), "-f", "glb", "-d", str(self.tmp))
         self.assertEqual(code, 0, text)
@@ -165,6 +202,69 @@ class TestLegacyRewrite(Base):
             return sorted((d.name, nm(f.material_id), nm(f.back_material_id))
                           for d in m.definitions.values() for f in d.faces.values())
         self.assertEqual(paint(S2020), paint(out))
+
+    def test_applied_texture_size_and_placement_survive(self):
+        """Seit OpenSKP 1.3.0 skaliert add_face die Texturpunkte mit der Materialgroesse. Die echte
+        Kachelgroesse bleibt so erhalten (Materialbrowser, in SketchUp neu bemalte Flaechen), die
+        Texturlage jeder Flaeche auch: positioniert, projiziert, oben wie unten."""
+        from PIL import Image
+
+        png = self.tmp / "holz.png"
+        Image.new("RGB", (8, 8), (150, 90, 40)).save(png)
+        b = core.create()
+        mat = b.add_texture_material("Holz", str(png), applied_width=20.0, applied_height=10.0)
+        b.add_face([(0, 0, 0), (40, 0, 0), (40, 30, 0), (0, 30, 0)], material=mat,
+                   front_uv=[((0, 0, 0), (0.1, 0.0)), ((40, 0, 0), (1.5, 0.2)), ((0, 30, 0), (-0.3, 2.0))])
+        b.add_face([(50, 0, 0), (90, 0, 0), (90, 30, 0), (50, 30, 0)], material=mat)
+        b.add_face([(0, 40, 5), (0, 70, 5), (40, 70, 5), (40, 40, 5)], material=mat)  # Unterseite
+        src = self.tmp / "quelle.skp"
+        core.save_atomic(b, src)
+        out = self.tmp / "neu.skp"
+        core.rewrite_legacy(src, out)
+
+        def sizes(path):
+            return {mt.name: (round(mt.texture.width, 6), round(mt.texture.height, 6))
+                    for mt in SkpFile.open(str(path)).parse().materials if mt.texture}
+
+        def uvs(path):
+            sc = core.build_scene(core.open_skp(path))
+            got = {}
+            for prim in sc.glb_primitives:
+                if not len(prim.uvs):
+                    continue
+                pos = np.asarray(prim.positions, np.float64).reshape(-1, 3)
+                for p, t in zip(pos, np.asarray(prim.uvs, np.float64).reshape(-1, 2)):
+                    got[tuple(np.round(p, 4))] = t
+            return got
+
+        self.assertEqual(sizes(src), {"Holz": (20.0, 10.0)})
+        self.assertEqual(sizes(out), sizes(src))
+        a, c = uvs(src), uvs(out)
+        self.assertEqual(len(a), 12)
+        self.assertEqual(set(a), set(c))
+        self.assertLess(max(float(np.abs(a[k] - c[k]).max()) for k in a), 1e-4)
+
+    def test_face_me_components_survive(self):
+        """"Immer zur Kamera drehen" und "Schatten zur Sonne" (2D-Personen, Baeume) kann der
+        OpenSKP-Writer seit 1.3.0 schreiben, rewrite_legacy uebernimmt beides."""
+        b = core.create()
+        with b.add_component_definition("Person", always_faces_camera=True, shadows_face_sun=True) as p:
+            p.add_face([(0, 0, 0), (10, 0, 0), (10, 0, 20)])
+        with b.add_component_definition("Kiste") as k:
+            k.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0)])
+        b.add_instance(p, translation=(0, 0, 0))
+        b.add_instance(k, translation=(20, 0, 0))
+        src = self.tmp / "person.skp"
+        core.save_atomic(b, src)
+        out = self.tmp / "person_2017.skp"
+        core.rewrite_legacy(src, out)
+
+        def flags(path):
+            return {d.name: (d.always_faces_camera, d.shadows_face_sun)
+                    for d in SkpFile.open(str(path)).parse().definitions.values()}
+
+        self.assertEqual(flags(src), {"Person": (True, True), "Kiste": (False, False)})
+        self.assertEqual(flags(out), flags(src))
 
 
 class TestTriangulation(unittest.TestCase):

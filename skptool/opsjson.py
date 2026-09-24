@@ -53,8 +53,12 @@ def load_ops(raw: str, stdin=None) -> list:
             raise SystemExit(f"--ops -: stdin ist leer, erwartet wird eine Liste wie {EXAMPLE}")
     elif text[0] not in "[{":
         path = Path(raw)
-        if not path.is_file():
-            raise SystemExit(f"--ops: Datei nicht gefunden (oder keine normale Datei): {raw}")
+        try:
+            ist_datei = path.is_file()
+        except OSError:  # unter Linux/macOS z. B. ENAMETOOLONG, das is_file nicht selbst abfaengt
+            ist_datei = False
+        if not ist_datei:
+            raise SystemExit(f"--ops: Datei nicht gefunden (oder keine normale Datei): {raw[:200]}")
         if path.stat().st_size > MAX_BYTES:
             raise SystemExit(f"--ops: Datei ist groesser als {MAX_BYTES // 2**20} MB")
         with path.open("rb") as fh:
@@ -74,4 +78,23 @@ def load_ops(raw: str, stdin=None) -> list:
         raise SystemExit(f"--ops braucht eine Liste wie {EXAMPLE}")
     if len(data) > MAX_OPS:
         raise SystemExit(f"--ops: hoechstens {MAX_OPS} Operationen ({len(data)} angegeben)")
+    _pruefe_endlich(data)
     return data
+
+
+def _pruefe_endlich(node, tiefe: int = 0) -> None:
+    """Nicht endliche Zahlen ablehnen. parse_constant faengt nur die Woerter NaN/Infinity ab,
+    nicht einen Ueberlauf wie 1e400, der still zu inf wird. Die feste Liste von Operationen prueft
+    das spaeter noch einmal, aber --ops soll gar nicht erst inf/nan durchreichen."""
+    if tiefe > 64:
+        raise SystemExit("--ops ist zu tief verschachtelt")
+    if isinstance(node, float):
+        import math
+        if not math.isfinite(node):
+            raise SystemExit("--ops enthaelt eine nicht endliche Zahl (inf/nan), das ist nicht erlaubt")
+    elif isinstance(node, dict):
+        for v in node.values():
+            _pruefe_endlich(v, tiefe + 1)
+    elif isinstance(node, list):
+        for v in node:
+            _pruefe_endlich(v, tiefe + 1)

@@ -6,11 +6,61 @@ Format nach [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), Versionen 
 
 ### Noch offen (geplant für die nächsten Versionen)
 
-- **OpenSKP 1.3.0:** Upgrade angefangen, noch nicht geprüft und nicht enthalten. Bringt die neue Abhängigkeit `mapbox-earcut` mit und liest vermutlich auch sehr alte Dateien (SketchUp 7 und älter). Vor der Übernahme: Quellcode-Prüfung, volle Testsuite, Vergleich alt gegen neu mit `skptool diff`.
-- **Materialien gleicher Farbe** werden beim Import nach Blender noch verwechselt (das erste Material mit derselben Farbe gewinnt).
-- **Getönte Texturen** (SketchUp "Einfärben") verlieren beim Umschreiben ihre Tönung.
-- **Noch nicht in echten Programmen geprüft:** 3MF in einem Slicer, der MCP-Server in Claude Code und Claude Desktop, die CSV aus `report` in Excel, der parallele Stapelbetrieb unter Linux und macOS mit echten Dateien.
-- Zwei Live-Tests sind unter starker Last auf dem Rechner unzuverlässig (Latenzgrenze, Zählung fremder Blender-Prozesse).
+- **Farben im Slicer:** Die 3MF-Datei enthält Materialfarben, PrusaSlicer und OrcaSlicer zeigen sie aber nicht an. Dafür bräuchte es die Materials-Erweiterung von 3MF.
+- **Noch nicht in echten Programmen geprüft:** der MCP-Server in den Apps Claude Desktop und Claude Code selbst (geprüft mit MCP Inspector und offiziellem Python-SDK), der parallele Stapelbetrieb unter macOS mit echten Dateien.
+- **Noch nicht in SketchUp geprüft:** ob SketchUp die Tönung getönter Texturen aus dem 2017-Format anzeigt, ob Texte und Bemaßungen in Komponenten dort richtig erscheinen, die Lage von Texturen auf nach unten zeigenden Flächen und ausgeblendete Ebenen aus Dateien ab SketchUp 2021.
+- **Sehr alte Dateien** (SketchUp 3 bis 8) sind mit `skptool` mangels Testdateien nicht geprüft.
+- **Live-Tests unter Linux und macOS:** Die Zuordnung der selbst gestarteten Blender-Prozesse über `ps` ist dort nur mit einem Parser-Test geprüft, die Tests mit Blender-Fenster laufen nur unter Windows.
+- **Blender-Erweiterung:** Importiert man in eine Szene, die schon eine Collection „Layer0" hat, heißt die neue „Layer0.001" und wird beim Export ein eigener Tag.
+
+## [0.3.0] - 2026-09-24
+
+### Hinzugefügt
+
+- **Blender-Erweiterung** `skptool_io`: File > Import und File > Export > SketchUp (.skp) in Blender 4.2 oder neuer, über das installierte skptool (ohne OpenSKP in der Erweiterung). Import über `.blend` (Tags, Flächen, harte Kanten bleiben), Export der Szene oder Auswahl, Modifikatoren wahlweise, Fortschritt in der Statusleiste, Esc bricht ab. Bauen und prüfen mit `tools/extension_bauen.py`.
+- **Installierbar als Paket** (`pyproject.toml`): `pipx install git+https://github.com/nexos-1/skptool` oder `uv tool install ...` ergibt den Befehl `skptool`. CI baut das Wheel, installiert es sauber und prüft den Befehl.
+- `tools/linux_e2e.sh`: Linux-Prüfung mit echten Dateien in Docker (Python 3.12, Blender 5.2.0, Projektordner nur lesend).
+- **Englische Doku:** README.en.md und SECURITY.en.md mit Sprachumschalter. `tests/test_doku.py` prüft Schalter, Beispiele, Links und Anker der Doku gegen den echten Parser.
+- `skptool report --csv-international`: CSV nach RFC 4180 (Komma, Dezimalpunkt) für Excel mit englischer Spracheinstellung und für Skripte.
+- `skptool open --force` erzeugt eine vorhandene `.blend` neu, auch wenn sie neuer ist als die `.skp`.
+- **MCP-Server:** `skp_convert` schreibt `.3mf` (nur aus `.skp`, ohne Blender). JSON-RPC-Batches, wenn Protokoll 2025-03-26 ausgehandelt ist (diese Version verlangt sie). Mit echten Clients geprüft: MCP Inspector 2.6.0 und offizielles Python-SDK 2.2.0, dazu die offiziellen JSON-Schemas je Protokollversion (`tools/mcp_sdk_pruefung.py`).
+
+### Geändert
+
+- **OpenSKP 1.3.0** (neue Abhängigkeit `mapbox-earcut` 2.1.0), als einzige Ausnahme von der 14-Tage-Regel nach Prüfung von Paket und Quellcode. Einlesen großer Dateien braucht deutlich weniger Arbeitsspeicher (Testmodell: 323 statt 538 MB).
+- Ausgeblendete Ebenen aus Dateien ab SketchUp 2021 bleiben ausgeblendet.
+- Beim Umschreiben ins 2017-Format bleiben die echte Kachelgröße der Texturen und das Verhalten „immer zur Kamera drehen" / „Schatten zur Sonne" erhalten.
+- Texturen auf nach unten zeigenden Flächen liegen wie in SketchUp (laut OpenSKP gemessen, vorher um 180 Grad gedreht).
+- IFC-Export in Millimetern mit Z nach oben (vorher Zoll-Werte unter der Einheit Millimeter, Modell lag auf der Seite); lose Kanten kommen als Anmerkungen mit.
+- `skptool report` nennt bei sehr alten Dateien den Stand von OpenSKP 1.3.0 (SketchUp 7 und 8 laut Projekt lesbar, bei 3, 4 und 6 Lesefehler bekannt).
+- **Umschreiben ins 2017-Format:** Frei gesetzte Texte und Bemaßungen bleiben erhalten, auch in Komponenten. Alle Attribut-Wörterbücher der Platzierungen kommen mit ihren Typen an, bisher nur `dynamic_attributes` als Text. Was nicht übertragen werden kann (Szenen, Schnittebenen, verankerte Texte, Formeln dynamischer Komponenten), meldet `convert` je Art in einer Zeile mit Anzahl, `skptool report` sagt dasselbe.
+- `skptool report` warnt nicht mehr vor Materialien gleicher Farbe, und bei getönten Texturen nur noch davor, dass die Art der Tönung verloren geht.
+- **MCP-Server:** Bei einer unbekannten Protokollversion bietet der Server jetzt seine neueste an (2025-11-25) statt 2025-06-18.
+
+### Behoben
+
+- **Texturen nicht mehr halbdurchsichtig:** Texturen aus Dateien, die skptool oder OpenSKP geschrieben hat, kamen in der `.glb` und in Blender als leicht durchsichtig an (Deckkraft 0,996, in Blender wie Glas sortiert) und über Blender mit dieser Deckkraft zurück; durchsichtige Texturen verloren etwas Deckkraft (0,5 wurde 0,498). Ursache war der Platzhalter der Durchschnittsfarbe, den OpenSKP als Deckkraft las.
+- **Doppelte interne IDs:** Ins 2017-Format geschriebene Dateien enthielten mit OpenSKP 1.2.0 je nach Modell 2 bis 45 doppelte persistente IDs, die laut OpenSKP dazu führen können, dass SketchUp die Datei nicht speichern kann. Mit 1.3.0 kommen alle IDs aus einem Zähler, auch die von Texten und Bemaßungen (geprüft in `tests/test_anmerkungen.py`).
+- **Materialien gleicher Farbe** werden nicht mehr verwechselt: jede Fläche behält ihr SketchUp-Material, auch über Blender.
+- **Getönte Texturen** (SketchUp "Einfärben") behalten beim Umschreiben und auf dem Weg über Blender ihre Tönung. Die `.glb` enthält das nach SketchUps Verfahren getönte Bild.
+- Texturen in der `.glb` sind nicht mehr zu dunkel. Durchscheinende Texturen bleiben durchscheinend, Flächen mit nur hinten bemalter Seite drehen sich über Blender nicht mehr um, unbenutzte Farbmaterialien bleiben im Modell.
+- **`skptool diff`** paart gleiche Teile jetzt von oben nach unten und optimal: Ein verschobener Tisch erscheint als ein Eintrag, nicht mehr als Beine mit unsinnigen Wegen. „verschoben um" misst relativ zur übergeordneten Gruppe (die Matrizen im JSON bleiben Weltlagen), eine fehlende Gruppe steht als ein Eintrag da.
+- **`skptool open`** prüft alles, bevor es schreibt: Ist die `.blend` neuer als die `.skp`, bricht es ab (neu: `--force`). Bisher wurde die `.blend` still überschrieben, auch wenn danach eine Prüfung scheiterte.
+- **3MF:** Gedrehte oder skalierte Platzierungen derselben Komponente lagen in OrcaSlicer und Bambu Studio neben der richtigen Stelle (bis über einen Meter). Netze liegen jetzt um ihre Mitte, geprüft in PrusaSlicer 2.9.6, OrcaSlicer 2.4.2, lib3mf und gegen das XSD der 3MF-Spezifikation.
+- **`report --csv`:** Namen wie „1-2", „0012" oder „12:30" kommen in Excel nicht mehr als Datum, Zahl oder Uhrzeit an. Geprüft in Excel 16, LibreOffice 26.2 und (HTML) Edge 153.
+- `convert --unit-scale` rechnete mit dem Kehrwert: `--unit-scale 1.0` ergab 1 Zoll statt 1 Meter pro Blender-Einheit.
+- **Stapelbetrieb unter Linux in Containern:** Der Speicherwächter beachtet jetzt die Speichergrenze der cgroup (Docker `--memory`, Kubernetes, systemd). Bisher plante `--jobs auto` nach dem Speicher des ganzen Rechners.
+- **MCP-Server:** Blender wird auch gefunden, wenn der Client ohne `ProgramFiles` startet (so das Python-SDK): fehlende Ordner-Variablen kommen aus Windows selbst. Die Fehlerantwort auf eine ungültige Anfrage trägt deren id, wenn sie erkennbar ist.
+- Live-Tests zählen beim Aufräumen nur noch selbst gestartete Blender-Prozesse und messen die Latenz getrennt nach Zeit in Blender und Abholen durch den Timer; parallel laufende Blender oder Last auf dem Rechner färben sie nicht mehr falsch rot.
+- README korrigiert: Überschreiben ohne `--force` nur bei mehreren Dateien, Box bei `list`, `diff --nur modell`, fehlende Schalter ergänzt.
+
+### Sicherheit
+
+- **Fuzzing** aller Eingänge (`tools/fuzz.py`, gut 15.000 Fälle): PLY mit gefälschtem Kopf ließ Blender 9 bis 12 GB reservieren (jetzt vorher abgelehnt), die Versionserkennung las ganze Dateien, der Live-Client ließ sich durch tropfenweises Senden festhalten, `--ops` nahm `1e400` als Unendlich an, kaputte ZIP-Versionen und manche Fehler kamen als englische Python-Meldung oder über zwei Zeilen.
+- **Blender-Erweiterung** nur mit der Berechtigung „files", ohne Netzwerk. skptool startet sie nur über den Pfad aus den Add-on-Einstellungen, ohne Shell und nie über `.cmd`/`.bat`.
+- Unsinnige Kachelgrößen und ungültige Texturpunkte (NaN) aus präparierten Dateien werden beim Umschreiben abgefangen.
+- `mapbox-earcut` (kompilierte Erweiterung, neu mit OpenSKP 1.3.0) wird nur aus dem Lock mit Prüfsummen installiert. Das Paket wird per Trusted Publishing aus dem GitHub-Projekt der Bindung veröffentlicht, sein `earcut.hpp` entspricht mapbox/earcut.hpp.
+- Bei Installation mit pipx oder uv tool lädt `skptool` keine Module aus dem aktuellen Ordner, obwohl der Starter der Paketverwaltung Python ohne `-P` startet (`tests/test_paket.py`).
 
 ## [0.2.0] - 2026-09-23
 

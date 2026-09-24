@@ -102,5 +102,22 @@ class TestOpsStdin(unittest.TestCase):
             self.assertEqual(core.placed_face_count(m), 128 + 6)
 
 
+class TestOpsPfad(unittest.TestCase):
+    def test_zu_langer_name_ist_saubere_meldung(self):
+        """Unter Linux/macOS wirft Path.is_file bei ueberlangem Namen ENAMETOOLONG, statt False zu
+        liefern (in der CI gefunden). Muss wie "Datei nicht gefunden" enden, nie als OSError."""
+        from unittest import mock
+        err = OSError(36, "File name too long")
+        with mock.patch.object(Path, "is_file", side_effect=err):
+            with self.assertRaises(SystemExit) as cm:
+                load_ops("x" * 5000)
+        self.assertIn("Datei nicht gefunden", str(cm.exception))
+        self.assertLess(len(str(cm.exception)), 400)  # der Text wird gekuerzt wiedergegeben
+
+    def test_echter_ueberlanger_text(self):
+        with self.assertRaises(SystemExit):
+            load_ops("" + "a" * 5000)
+
+
 if __name__ == "__main__":
     unittest.main()

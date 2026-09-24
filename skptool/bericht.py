@@ -4,9 +4,12 @@ Je Datei die Daten aus core.info() plus eine Analyse (platzierte Flaechen, Mater
 Texturen, was beim Umwandeln verloren geht) und Warnungen, die sich aus den Grenzen im README
 ableiten. Eine Datei, die nicht lesbar ist, wird eine Fehlerzeile, der Lauf geht weiter.
 
-Ausgabe als Text (Standard), JSON, CSV (Excel, deutsch) oder HTML (eine Datei ohne Skripte und
-ohne externe Verweise). Namen stammen aus fremden Dateien und werden je Format entschaerft:
-Steuerzeichen maskiert, CSV gegen Formeln, HTML komplett escaped.
+Ausgabe als Text (Standard), JSON, CSV (Excel deutsch oder international) oder HTML (eine Datei
+ohne Skripte und ohne externe Verweise). Namen stammen aus fremden Dateien und werden je Format
+entschaerft: Steuerzeichen maskiert, CSV gegen Formeln und gegen Umdeuten in Zahlen oder Daten,
+HTML komplett escaped.
+
+Geprueft in Excel 16 (Microsoft 365, deutsch), LibreOffice 26.2 und Edge 153 (HTML).
 
 Die Anbindung an die Kommandozeile ist add_report_parser(), eingebunden in cli.build_parser().
 """
@@ -20,6 +23,7 @@ import html
 import io
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -30,7 +34,6 @@ from skptool.gltf_writer import MAX_TEXTURE_SIDE
 
 GROSSE_DATEI = 50 * 2**20  # ab hier braucht das Einlesen viel Arbeitsspeicher (README "Grenzen")
 LISTE_MAX = 50  # Namen je Zelle bzw. Liste, der Rest wird gezaehlt
-DYNAMISCH = "dynamic_attributes"
 
 
 # ---------------------------------------------------------------- Dateien sammeln
@@ -103,14 +106,17 @@ def _platzierungen(model) -> int:
     return count(model.root)
 
 
-def analysiere(model) -> dict:
-    """Kennzahlen eines geparsten Modells, die core.info() nicht liefert."""
+def analysiere(model, parsed=None) -> dict:
+    """Kennzahlen eines geparsten Modells, die core.info() nicht liefert.
+
+    parsed: Rohergebnis des Parsers (SkpFile._parsed), nur fuer die Endpunkte von Bemassungen in
+    Dateien vor 2021. Ohne gelten solche Bemassungen beim Umschreiben als nicht uebertragbar."""
     alle = [model.root, *model.definitions.values()]
     instanzen = [inst for d in alle for inst in d.instances]
     bilder = sum(1 for inst in instanzen
                  if (ref := model.definitions.get(inst.ref_idx)) is not None and ref.is_image)
-    dynamisch = [inst.name or getattr(model.definitions.get(inst.ref_idx), "name", "") or "?"
-                 for inst in instanzen if DYNAMISCH in (inst.attribute_dictionaries or {})]
+    dynamisch = core.dynamic_instances(model)
+    notizen = core.anmerkungen(model, parsed)
 
     mats = list(model.materials)
     getoent = [mt.name for mt in mats if mt.texture is not None and mt.colorized]
@@ -144,9 +150,6 @@ def analysiere(model) -> dict:
     gleiche_farben = [{"farbe": "#%02x%02x%02x" % rgb, "materialien": names}
                       for (rgb, _), names in gruppen.items() if len(names) > 1]
 
-    # Dateien vor 2021 fuehren Bemassungen der obersten Ebene doppelt (Modell und Wurzel)
-    bemassungen = max(len(model.dimensions or []), len(model.root.dimensions)) + \
-        sum(len(d.dimensions) for d in model.definitions.values())
     return {
         "platzierte_flaechen": core.placed_face_count(model),
         "definitionen": sum(1 for d in model.definitions.values() if not d.is_image),
@@ -158,11 +161,14 @@ def analysiere(model) -> dict:
         "getoente_materialien": getoent,
         "texturen": texturen,
         "szenen": len(model.pages or []),
-        "bemassungen": bemassungen,
-        "texte": sum(len(d.texts) for d in alle),
+        # Dateien vor 2021 fuehren Bemassungen der obersten Ebene doppelt, core.anmerkungen zaehlt einmal
+        "bemassungen": notizen.masse_gesamt,
+        "texte": notizen.texte_gesamt,
         "schnittebenen": sum(len(d.section_planes) for d in alle),
         "dynamische_komponenten": dynamisch,
         "gleiche_farben": gleiche_farben,
+        # dieselben Zeilen, die rewrite_legacy in stats["verluste"] meldet
+        "verluste_umschreiben": core.verlust_zeilen(model, notizen),
     }
 
 
@@ -189,8 +195,11 @@ def warnungen_version(version) -> list[str]:
         return ["Datei aus SketchUp 2019: OpenSKP scheitert laut Projekt an manchen Dateien dieser Version, "
                 "Ergebnis genau pruefen"]
     if major is not None and major < 13:
-        return [f"Sehr alte Version (SketchUp {major}): nicht jede Datei ist lesbar, "
-                "Version 7 und aelter liest erst OpenSKP 1.3.0"]
+        # Stand OpenSKP 1.3.0 (Changelog, #284): 7 und 8 laut Projekt behoben, 3, 4 und 6 mit
+        # bekannten Lesefehlern. Mangels Testdateien in skptool nicht selbst geprueft.
+        return [f"Sehr alte Version (SketchUp {major}): nicht jede Datei ist lesbar. OpenSKP 1.3.0 liest laut "
+                "Projekt Dateien aus SketchUp 7 und 8, fuer 3, 4 und 6 sind Lesefehler bekannt; "
+                "Ergebnis genau pruefen"]
     return []
 
 
@@ -202,22 +211,18 @@ def warnungen(version, groesse_bytes: int, a: dict) -> list[str]:
                    "(bei 200 MB gut 12 GB)")
     if a["getoente_materialien"]:
         n = len(a["getoente_materialien"])
-        out.append(f"{_mehrzahl(n, 'getoente Textur', 'getoente Texturen')} (Colorize) "
-                   f"{'verliert' if n == 1 else 'verlieren'} beim Umschreiben die Toenung: "
-                   f"{_namen(a['getoente_materialien'])}")
-    fehlt = [text for n, text in ((a["szenen"], _mehrzahl(a["szenen"], "Szene", "Szenen")),
-                                  (a["bemassungen"], _mehrzahl(a["bemassungen"], "Bemassung", "Bemassungen")),
-                                  (a["texte"], _mehrzahl(a["texte"], "Text", "Texte")),
-                                  (a["schnittebenen"], _mehrzahl(a["schnittebenen"], "Schnittebene",
-                                                                 "Schnittebenen"))) if n]
-    if fehlt:
-        out.append(f"Werden nicht uebertragen: {', '.join(fehlt)}")
-    if a["dynamische_komponenten"]:
-        n = len(a["dynamische_komponenten"])
-        out.append(f"{_mehrzahl(n, 'dynamische Komponente', 'dynamische Komponenten')} ({DYNAMISCH}): "
-                   f"das dynamische Verhalten wird nicht uebertragen: {_namen(a['dynamische_komponenten'])}")
-    for g in a["gleiche_farben"]:
-        out.append(f"Materialien gleicher Farbe {g['farbe']} koennen verwechselt werden: {_namen(g['materialien'])}")
+        out.append(f"{_mehrzahl(n, 'getoente Textur', 'getoente Texturen')} (Colorize): beim Umschreiben "
+                   "bleibt die Toenung erhalten, die Art (Farbton verschieben oder einfaerben) hat im "
+                   f"2017-Format kein bekanntes Feld: {_namen(a['getoente_materialien'])}")
+    # Szenen, Schnittebenen, nicht uebertragbare Texte und Bemassungen, dynamische Komponenten:
+    # wortgleich mit dem, was rewrite_legacy beim Umschreiben meldet (core.verlust_zeilen)
+    out += a.get("verluste_umschreiben") or []
+    nur_skp = [text for n, text in ((a["texte"], _mehrzahl(a["texte"], "Text", "Texte")),
+                                    (a["bemassungen"], _mehrzahl(a["bemassungen"], "Bemassung", "Bemassungen")))
+               if n]
+    if nur_skp:
+        out.append("Nur beim Umschreiben nach .skp uebertragen, nicht nach Blender und in andere Formate: "
+                   + ", ".join(nur_skp))
     if a["texturen"]["zu_gross"]:
         n = len(a["texturen"]["zu_gross"])
         out.append(f"{_mehrzahl(n, 'Textur', 'Texturen')} mit mehr als {MAX_TEXTURE_SIDE} px Kantenlaenge "
@@ -241,7 +246,7 @@ def pruefe_datei(pfad: Path, bounds: bool = False, verbose: bool = False) -> dic
         model = core.model_of(skp)  # einmal einlesen, info() und die Analyse nutzen dasselbe Objekt
         sekunden = time.perf_counter() - t
         daten = core.info(pfad, with_bounds=bounds, skp=skp)
-        analyse = analysiere(model)
+        analyse = analysiere(model, skp._parsed)
         eintrag.update(ok=True, version=daten["version"], format=daten["format"],
                        einlesezeit_s=round(sekunden, 2), info=daten, analyse=analyse,
                        warnungen=warnungen(daten["version"], daten["size_bytes"], analyse))
@@ -365,6 +370,31 @@ def format_json(eintraege: list[dict]) -> str:
 # Zellen mit diesem Anfang wertet Excel/LibreOffice als Formel (auch als Vollbreiten-Zeichen)
 _FORMEL_START = ("=", "+", "-", "@", "\t", "\r", "\uff1d", "\uff0b", "\uff0d", "\uff20")
 
+# CSV-Dialekte: Trennzeichen und Dezimalzeichen. "de" fuer Excel/LibreOffice mit deutscher
+# Spracheinstellung (Listentrenner Semikolon), "international" nach RFC 4180 fuer Excel mit
+# englischer Spracheinstellung und fuer Skripte. Beide UTF-8 mit BOM: ohne BOM liest Excel die
+# Datei als ANSI und zerlegt Umlaute. Eine Zeile "sep=;" waere keine Hilfe: Excel wertet dann das
+# BOM nicht mehr aus (in Excel 16 geprueft) und jeder CSV-Leser saehe eine falsche Kopfzeile.
+CSV_DIALEKTE = {"de": (";", ","), "international": (",", ".")}
+
+# Namen, die Excel beim Oeffnen als Zahl, Datum, Uhrzeit, Prozent, Waehrung oder Wahrheitswert
+# deutet ("1-2" wird 01. Feb, "0012" wird 12, "12:30" eine Uhrzeit, "WAHR" ein Wahrheitswert).
+# Solche Namen bekommen wie beim Formelschutz ein Apostroph und bleiben so Text.
+NAMENSSPALTEN = {"datei", "ausgeblendete_ebenen", "ebenen_namen", "materialien_namen"}
+_ZAHLENZEICHEN = r"[\d\s.,:/()+\-%\u20ac$eE]"
+_EXCEL_ZAHL = re.compile(rf"{_ZAHLENZEICHEN}*\d{_ZAHLENZEICHEN}*")
+_MONATE = "jan|feb|m\u00e4r|mrz|mar|apr|mai|may|jun|jul|aug|sep|okt|oct|nov|dez|dec"
+_EXCEL_DATUM = re.compile(rf"(?i)(?:{_MONATE})\w*\.?[\s\-/]*\d{{1,4}}|\d{{1,2}}[\s.\-/]*(?:{_MONATE})\w*\.?"
+                          rf"(?:[\s\-/]*\d{{2,4}})?")
+_EXCEL_WAHRHEIT = {"wahr", "falsch", "true", "false"}
+
+
+def excel_deutet_um(text: str) -> bool:
+    """True, wenn Excel diesen Text beim Oeffnen einer CSV vermutlich nicht als Text uebernimmt.
+    Lieber einmal zu oft markiert als ein Name, der als Datum ankommt."""
+    t = text.strip()
+    return bool(t) and bool(_EXCEL_ZAHL.fullmatch(t) or _EXCEL_DATUM.fullmatch(t) or t.lower() in _EXCEL_WAHRHEIT)
+
 CSV_SPALTEN = ["datei", "status", "fehler", "version", "format", "groesse_bytes", "einlesezeit_s", "flaechen",
                "platzierte_flaechen", "definitionen", "platzierungen", "bilder", "ebenen", "ausgeblendete_ebenen",
                "materialien", "texturiert", "getoent", "transparent", "texturen", "textur_bytes",
@@ -372,18 +402,19 @@ CSV_SPALTEN = ["datei", "status", "fehler", "version", "format", "groesse_bytes"
                "abmessungen_m", "warnungen", "ebenen_namen", "materialien_namen"]
 
 
-def _zelle(value):
-    """Wert fuer eine CSV-Zelle: Zahlen bleiben Zahlen, Text wird gegen Formeln entschaerft."""
+def _zelle(value, spalte: str = "", dezimal: str = ","):
+    """Wert fuer eine CSV-Zelle: Zahlen bleiben Zahlen, Text wird gegen Formeln entschaerft,
+    Namen, die Excel umdeuten wuerde, bleiben Text."""
     if value is None:
         return ""
     if isinstance(value, bool):
         return "ja" if value else "nein"
     if isinstance(value, float):
-        return f"{value:.2f}".replace(".", ",")  # deutsches Excel
+        return f"{value:.2f}".replace(".", dezimal)
     if isinstance(value, int):
         return value
     text = _sicher(value)
-    if text.lstrip(" ").startswith(_FORMEL_START):
+    if text.lstrip(" ").startswith(_FORMEL_START) or (spalte in NAMENSSPALTEN and excel_deutet_um(text)):
         text = "'" + text
     return text
 
@@ -393,7 +424,7 @@ def _liste(names) -> str:
     return ", ".join(names[:LISTE_MAX]) + (f" ... ({len(names) - LISTE_MAX} weitere)" if len(names) > LISTE_MAX else "")
 
 
-def _csv_zeile(e: dict) -> dict:
+def _csv_zeile(e: dict, dezimal: str = ",") -> dict:
     row = {"datei": e["datei"], "status": "ok" if e["ok"] else "Fehler", "fehler": e["fehler"],
            "version": e.get("version"), "groesse_bytes": e.get("groesse_bytes"),
            "warnungen": " | ".join(e.get("warnungen") or [])}
@@ -410,17 +441,19 @@ def _csv_zeile(e: dict) -> dict:
                    schnittebenen=a["schnittebenen"], dynamische_komponenten=len(a["dynamische_komponenten"]),
                    abmessungen_m=_abmessungen(info), ebenen_namen=_liste(l["name"] for l in info["layers"]),
                    materialien_namen=_liste(mt["name"] for mt in info["materials"]))
-    return {k: _zelle(row.get(k)) for k in CSV_SPALTEN}
+    return {k: _zelle(row.get(k), k, dezimal) for k in CSV_SPALTEN}
 
 
-def format_csv(eintraege: list[dict], zeilenende: str = "\r\n") -> str:
-    """CSV fuer ein deutsches Excel: Semikolon, Dezimalkomma. Das BOM setzt die Ausgabe davor.
+def format_csv(eintraege: list[dict], zeilenende: str = "\r\n", dialekt: str = "de") -> str:
+    """CSV fuer Excel: dialekt "de" mit Semikolon und Dezimalkomma, "international" mit Komma und
+    Dezimalpunkt (siehe CSV_DIALEKTE). Das BOM setzt die Ausgabe davor.
     Fuer die Konsole zeilenende="\\n": die Maskierung dort wuerde ein CR sichtbar machen."""
+    trenner, dezimal = CSV_DIALEKTE[dialekt]
     buf = io.StringIO(newline="")
-    w = csv.DictWriter(buf, fieldnames=CSV_SPALTEN, delimiter=";", lineterminator=zeilenende)
+    w = csv.DictWriter(buf, fieldnames=CSV_SPALTEN, delimiter=trenner, lineterminator=zeilenende)
     w.writeheader()
     for e in eintraege:
-        w.writerow(_csv_zeile(e))
+        w.writerow(_csv_zeile(e, dezimal))
     return buf.getvalue()
 
 
@@ -551,8 +584,9 @@ def cmd_report(a) -> int:
         clash = next((p for p in pfade if cli._same_file(ziel, p)), None)
         if clash is not None:
             raise SystemExit(f"Ziel {ziel} ist selbst eine Eingabe ({clash.name}). Nichts geschrieben.")
-    fmt = "json" if a.json else "csv" if a.csv else "html" if a.html else \
+    fmt = "json" if a.json else "csv" if a.csv or a.csv_international else "html" if a.html else \
         _ENDUNGEN.get(ziel.suffix.lower(), "text") if ziel is not None else "text"
+    dialekt = "international" if a.csv_international else "de"
 
     def fortschritt(msg):
         print(f"  {msg}", file=sys.stderr, flush=True)
@@ -563,7 +597,7 @@ def cmd_report(a) -> int:
     if fmt == "json":
         text = format_json(eintraege)
     elif fmt == "csv":
-        text = format_csv(eintraege, zeilenende="\r\n" if ziel is not None else "\n")
+        text = format_csv(eintraege, zeilenende="\r\n" if ziel is not None else "\n", dialekt=dialekt)
     elif fmt == "html":
         text = format_html(eintraege, sekunden)
     else:
@@ -586,7 +620,12 @@ def add_report_parser(sub) -> None:
     p.add_argument("inputs", nargs="+", help="Dateien oder Muster, z. B. \"projekte\\*.skp\"")
     fmt = p.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="Ein JSON-Dokument fuer alle Dateien")
-    fmt.add_argument("--csv", action="store_true", help="CSV fuer Excel (UTF-8 mit BOM, Semikolon)")
+    fmt.add_argument("--csv", action="store_true",
+                     help="CSV fuer Excel und LibreOffice mit deutscher Spracheinstellung (UTF-8 mit BOM, "
+                          "Semikolon, Dezimalkomma)")
+    fmt.add_argument("--csv-international", action="store_true",
+                     help="CSV nach RFC 4180 (UTF-8 mit BOM, Komma, Dezimalpunkt), fuer Excel mit englischer "
+                          "Spracheinstellung und fuer Skripte")
     fmt.add_argument("--html", action="store_true", help="Eine HTML-Datei ohne Skripte und externe Verweise")
     p.add_argument("-o", "--output", help="Bericht in diese Datei schreiben (ohne Schalter bestimmt die "
                                           "Endung .json/.csv/.html das Format)")

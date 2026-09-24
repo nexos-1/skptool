@@ -119,9 +119,18 @@ def _drop_stale(path: Path, data: dict) -> None:
 
 # ---------------------------------------------------------------- Anfragen
 
-def _read_line(conn, limit: int) -> bytes:
+def _read_line(conn, limit: int, frist: float | None = None) -> bytes:
+    """Eine Zeile lesen. frist: Sekunden fuer die GANZE Zeile, nicht je Paket. Ohne Gesamtfrist
+    haette ein fremder Prozess auf dem Port den Client mit einem Byte alle paar Sekunden beliebig
+    lange festhalten koennen (socket.timeout gilt nur je recv)."""
+    ende = None if frist is None else time.monotonic() + frist
     buf = bytearray()
     while b"\n" not in buf:
+        if ende is not None:
+            rest = ende - time.monotonic()
+            if rest <= 0:
+                raise socket.timeout("Gesamtfrist fuer die Antwort ueberschritten")
+            conn.settimeout(rest)
         chunk = conn.recv(65536)
         if not chunk:
             break
@@ -149,7 +158,7 @@ def request(cmd: str, state: str | os.PathLike | None = None, timeout: float = 1
         with conn:
             conn.settimeout(10.0)
             try:
-                hello = json.loads(_read_line(conn, 4096).decode("utf-8"))
+                hello = json.loads(_read_line(conn, 4096, frist=10.0).decode("utf-8"))
             except (UnicodeDecodeError, ValueError, RecursionError):
                 raise LiveError("Auf dem Port antwortet kein skptool-Live-Blender") from None
             server_nonce = hello.get("hello") if isinstance(hello, dict) else None
@@ -161,7 +170,7 @@ def request(cmd: str, state: str | os.PathLike | None = None, timeout: float = 1
                    "auth": mac(token, "client", server_nonce, cnonce)}
             conn.settimeout(timeout + 10.0)  # der Server meldet sich spaetestens nach timeout selbst
             conn.sendall(json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n")
-            line = _read_line(conn, MAX_RESPONSE)
+            line = _read_line(conn, MAX_RESPONSE, frist=timeout + 10.0)
     except socket.timeout:
         raise LiveError(f"Blender hat nach {timeout:.0f} s nicht geantwortet (beschaeftigt oder ein Dialog "
                         "ist offen). Laenger warten mit --timeout.") from None
@@ -363,15 +372,39 @@ def default_export_target(src: Path) -> Path | None:
     return None
 
 
-def open_live(src: Path, blend: Path, a) -> int:
-    """Teil von skptool open ... --live, nachdem die .blend-Datei existiert."""
+def _gleiche_datei(x: Path, y: Path) -> bool:
+    try:
+        return x.resolve() == y.resolve() or (x.exists() and y.exists() and os.path.samefile(x, y))
+    except OSError:
+        return False
+
+
+def export_target(src: Path, blend: Path, a) -> Path | None:
+    """Exportziel fuer skptool open ... --live bestimmen und pruefen. Laeuft, bevor irgendeine Datei
+    geschrieben wird (auch die .blend), und bricht mit SystemExit ab."""
     explicit = bool(getattr(a, "export_skp", None))
     target = Path(a.export_skp) if explicit else default_export_target(src)
-    if target is not None and target.resolve() == src.resolve():
-        raise SystemExit(f"--export-skp darf nicht die Originaldatei sein ({src}). Bitte anderen Namen waehlen.")
-    if target is not None and not explicit and target.exists():
+    if target is None:
+        return None
+    if _gleiche_datei(target, src):
+        raise SystemExit(f"--export-skp darf nicht die Originaldatei sein ({src}). Bitte anderen Namen waehlen. "
+                         "Nichts geschrieben.")
+    if explicit and target.suffix.lower() != ".skp":
+        raise SystemExit(f"--export-skp braucht eine .skp-Datei, nicht {target.name}. Nichts geschrieben.")
+    if _gleiche_datei(target, blend):
+        raise SystemExit(f"--export-skp darf nicht die .blend-Datei sein ({blend}). Nichts geschrieben.")
+    if not explicit and target.exists():
         raise SystemExit(f"{target} gibt es schon und wuerde beim Speichern ueberschrieben. Zum Ueberschreiben "
-                         f'ausdruecklich angeben: --export-skp "{target}", sonst einen anderen Namen.')
+                         f'ausdruecklich angeben: --export-skp "{target}", sonst einen anderen Namen. '
+                         "Nichts geschrieben.")
+    return target
+
+
+def open_live(src: Path, blend: Path, a, target: Path | None | bool = False) -> int:
+    """Teil von skptool open ... --live, nachdem die .blend-Datei existiert. target: Ergebnis von
+    export_target() (cmd_open prueft es vor dem Umwandeln); ohne Angabe wird es hier geprueft."""
+    if target is False:
+        target = export_target(src, blend, a)
     try:
         # Aus einer .skp erzeugt: die .blend enthaelt nur eingebettete Daten, externe Bilder kommen
         # also vom Nutzer selbst. Bei fremden .blend gilt der sichere Standard (nur eingebettet).

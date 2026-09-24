@@ -8,9 +8,12 @@ OpenSKP-Szene und "skptool info" geprueft.
 import dataclasses
 import io
 import json
+import math
+import os
 import re
 import shutil
 import struct
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -342,6 +345,258 @@ class Test3mfEinzelheiten(Base):
             self.skipTest(f"trimesh kann 3MF hier nicht lesen: {exc}")
         got = read_3mf(out)
         np.testing.assert_allclose(scene.extents, got["size_mm"], atol=0.1)
+
+
+ZOLL = 25.4  # mm
+
+
+def teile_modell(path):
+    """Wuerfel 100 mm als Komponente: gerade, um 30 Grad gedreht, ungleich skaliert, gespiegelt und
+    verschachtelt (zwei uebereinander in einer zweiten Komponente), dazu ein loser Wuerfel 1 m.
+    Vorder- und Rueckseite haben verschiedene Farben (Rueckseiten fallen im 3MF weg)."""
+    b = core.create()
+    rot = b.add_material("Rot \u00c4", [200, 30, 30])
+    blau = b.add_material("Blau \u00df", [20, 40, 220])
+    grau = b.add_material("Grau", [150, 150, 150])
+
+    def wuerfel(add, s, mat, back=None, o=(0.0, 0.0, 0.0)):
+        p = [(o[0] + x * s, o[1] + y * s, o[2] + z * s) for x, y, z in
+             [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]]
+        for q in [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]:
+            add([p[i] for i in q], material=mat, **({"back_material": back} if back is not None else {}))
+
+    s = 100 / ZOLL
+    with b.add_component_definition("Wuerfel") as w:
+        wuerfel(w.add_face, s, rot, back=blau)
+    with b.add_component_definition("Paar") as paar:
+        paar.add_instance(w, translation=(0.0, 0.0, 0.0))
+        paar.add_instance(w, translation=(0.0, 0.0, 2 * s))
+    b.add_instance(w, name="gerade", translation=(0.0, 0.0, 0.0))
+    b.add_instance(w, name="gedreht", translation=(3 * s, 0.0, 0.0), rotation=((0, 0, 1), math.radians(30)))
+    b.add_instance(w, name="skaliert", translation=(6 * s, 0.0, 0.0), matrix3x3=(2, 0, 0, 0, 1, 0, 0, 0, 0.5))
+    b.add_instance(w, name="gespiegelt", translation=(10 * s, 0.0, 0.0), matrix3x3=(-1, 0, 0, 0, 1, 0, 0, 0, 1))
+    b.add_instance(paar, name="paar", translation=(0.0, 4 * s, 0.0))
+    wuerfel(b.add_face, 1000 / ZOLL, grau, o=(0.0, 20 * s, 0.0))  # 1 m, lose in der Wurzel
+    core.save_atomic(b, path)
+    return path
+
+
+def welt_punkte(got, digits=2):
+    """Alle Punkte der 3MF in Weltlage (mm), gerundet, als Menge."""
+    out = set()
+
+    def walk(oid, m, depth=0):
+        o = got["objects"][oid]
+        if "verts" in o:
+            w = o["verts"] @ m[:3] + m[3]
+            out.update(map(tuple, np.round(w, digits).tolist()))
+            return
+        for ref, cm in o["components"]:
+            walk(ref, np.vstack([cm[:3] @ m[:3], cm[3] @ m[:3] + m[3]]), depth + 1)
+
+    roots = set(got["objects"]) - {r for o in got["objects"].values() for r, _ in o.get("components", [])}
+    for oid in roots:
+        walk(oid, _matrix(None))
+    return out
+
+
+def gebackene_punkte(skp, digits=2):
+    """Punkte der gebackenen OpenSKP-Szene in SketchUp-Achsen (mm), gerundet, als Menge."""
+    out = set()
+    for prim in core.build_scene(skp).glb_primitives:
+        pos = np.asarray(prim.positions, np.float64).reshape(-1, 3) * 1000.0
+        out.update(map(tuple, np.round(np.column_stack([pos[:, 0], -pos[:, 2], pos[:, 1]]), digits).tolist()))
+    return {tuple(0.0 if v == 0 else v for v in p) for p in out}
+
+
+class Test3mfLage(Base):
+    """Lage der Teile, wie Slicer sie lesen (Befunde aus PrusaSlicer 2.9.6 und OrcaSlicer 2.4.2)."""
+
+    def export(self, src):
+        skp = core.open_skp(src)
+        isc = instanced_scene.build_instanced_scene(skp._parsed)
+        out = self.tmp / (Path(src).stem + ".3mf")
+        st = write_3mf(core.model_of(skp), isc, out, warn=lambda _t: None)
+        return skp, st, out
+
+    def test_netze_liegen_um_ihre_mitte(self):
+        """OrcaSlicer/Bambu Studio verschieben jede weitere Platzierung eines geteilten Netzes um dessen
+        unrotierte Mitte. Liegt die Mitte im Ursprung, ist das wirkungslos (vorher lagen gedrehte
+        Teile bis 1,1 m daneben)."""
+        for src in [S2017, S2020, S2026]:
+            if not src.exists():
+                continue
+            _, _, out = self.export(src)
+            for o in read_3mf(out)["objects"].values():
+                if "verts" in o:
+                    c = (o["verts"].min(axis=0) + o["verts"].max(axis=0)) / 2
+                    self.assertLessEqual(float(np.abs(c).max()), 1e-4, (src.name, o["name"], c))
+
+    def test_weltlage_wie_gebackene_szene(self):
+        """Gedreht, ungleich skaliert, gespiegelt, verschachtelt: jeder Punkt liegt wie in der von
+        OpenSKP gebackenen Szene, 1 m ist 1000 mm."""
+        src = teile_modell(self.tmp / "teile.skp")
+        skp, st, out = self.export(src)
+        got = read_3mf(out)
+        self.assertEqual(st["mirrored_variants"], 1)
+        self.assertEqual(got["components"], 7)  # 5 Platzierungen, davon eine mit 2 Teilen, plus loser Wuerfel
+        self.assertEqual(got["placed_triangles"], 7 * 12)  # Rueckseiten weg: 12 Dreiecke je Wuerfel
+        self.assertEqual(welt_punkte(got), gebackene_punkte(skp))
+        # x: 0 bis 1000 (loser Wuerfel, gespiegelter endet bei 1000), y: 0 bis 3000, z: 0 bis 1000
+        np.testing.assert_allclose(got["size_mm"], [1000.0, 3000.0, 1000.0], atol=1e-3)
+        grau = [o for o in got["objects"].values() if "verts" in o and len(o["verts"]) == 8
+                and np.ptp(o["verts"], axis=0).max() > 900]
+        self.assertEqual(len(grau), 1)
+        np.testing.assert_allclose(np.ptp(grau[0]["verts"], axis=0), [1000.0, 1000.0, 1000.0])
+
+
+# ---------------------------------------------------------------- Gegenproben mit echten Programmen
+# Laufen nur, wenn das Programm da ist. Pfade ueber Umgebungsvariablen:
+#   SKPTOOL_PRUSASLICER  prusa-slicer-console.exe (bzw. prusa-slicer)
+#   SKPTOOL_ORCASLICER   orca-slicer.exe
+#   SKPTOOL_3MF_XSD      Ordner mit core.xsd (Anhang B.1 der 3MF-Core-Spezifikation, braucht lxml)
+# lib3mf (pip install lib3mf) wird benutzt, wenn es importierbar ist.
+
+def _programm(env, *kandidaten):
+    p = os.environ.get(env)
+    if p:
+        return p if Path(p).is_file() else None
+    for k in kandidaten:
+        hit = shutil.which(k) if not Path(k).is_absolute() else (k if Path(k).is_file() else None)
+        if hit:
+            return hit
+    return None
+
+
+PRUSA = _programm("SKPTOOL_PRUSASLICER", "prusa-slicer-console", "prusa-slicer",
+                  r"C:\Program Files\Prusa3D\PrusaSlicer\prusa-slicer-console.exe")
+ORCA = _programm("SKPTOOL_ORCASLICER", "orca-slicer", r"C:\Program Files\OrcaSlicer\orca-slicer.exe")
+
+
+def _stl_dreiecke(path):
+    data = Path(path).read_bytes()
+    n = struct.unpack_from("<I", data, 80)[0]
+    return np.frombuffer(data, dtype=np.dtype([("n", "<3f4"), ("v", "<9f4"), ("a", "<u2")]),
+                         count=n, offset=84)["v"].reshape(-1, 3, 3).astype(np.float64)
+
+
+def _info(text):
+    """--info-Ausgabe von PrusaSlicer/OrcaSlicer: eine Liste von dicts je Objekt."""
+    blocks = re.split(r"^\[.*\]\s*$", text, flags=re.M)[1:]
+    return [dict(re.findall(r"^(\w+)\s*=\s*(\S+)\s*$", b, flags=re.M)) for b in blocks]
+
+
+class Test3mfEchteLeser(Base):
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = Path(tempfile.mkdtemp(prefix="skptool_3mf_leser_"))
+        cls.src = teile_modell(cls.dir / "teile.skp")
+        skp = core.open_skp(cls.src)
+        cls.skp = skp
+        cls.out = cls.dir / "teile.3mf"
+        write_3mf(core.model_of(skp), instanced_scene.build_instanced_scene(skp._parsed), cls.out,
+                  warn=lambda _t: None)
+        cls.soll = read_3mf(cls.out)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def run_prog(self, args, cwd):
+        p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=600, cwd=cwd)
+        return p.returncode, p.stdout + p.stderr
+
+    def assert_gleiche_geometrie(self, stl):
+        tris = _stl_dreiecke(stl)
+        self.assertEqual(len(tris), self.soll["placed_triangles"])
+        pts = tris.reshape(-1, 3)
+        pts = pts - pts.min(axis=0)  # Slicer duerfen das Ganze verschieben (auf die Platte stellen)
+        soll = np.array(sorted(welt_punkte(self.soll)))
+        soll = soll - soll.min(axis=0)
+        got = {tuple(p) for p in np.round(pts, 1).tolist()}
+        self.assertEqual(got, {tuple(p) for p in np.round(soll, 1).tolist()})
+
+    def test_lib3mf_streng(self):
+        try:
+            import lib3mf
+        except ImportError:
+            self.skipTest("lib3mf fehlt")
+        model = lib3mf.get_wrapper().CreateModel()
+        reader = model.QueryReader("3mf")
+        reader.SetStrictModeActive(True)
+        reader.ReadFromFile(str(self.out))
+        self.assertEqual(reader.GetWarningCount(), 0)
+        meshes, tris = 0, 0
+        it = model.GetMeshObjects()
+        while it.MoveNext():
+            meshes += 1
+            mo = it.GetCurrentMeshObject()
+            tris += mo.GetTriangleCount()
+            self.assertTrue(mo.IsManifoldAndOriented(), mo.GetName())
+        self.assertEqual(meshes, self.soll["mesh_objects"])
+        self.assertEqual(tris, self.soll["unique_triangles"])
+        items = model.GetBuildItems()
+        n = 0
+        while items.MoveNext():
+            n += 1
+        self.assertEqual(n, 1)
+
+    def test_xsd_der_core_spezifikation(self):
+        xsd = os.environ.get("SKPTOOL_3MF_XSD")
+        if not xsd or not (Path(xsd) / "core.xsd").is_file():
+            self.skipTest("SKPTOOL_3MF_XSD nicht gesetzt")
+        try:
+            from lxml import etree
+        except ImportError:
+            self.skipTest("lxml fehlt")
+        schema = etree.XMLSchema(etree.parse(str(Path(xsd) / "core.xsd")))
+        for src in [self.src, S2017, S2020, S2026]:
+            if not src.exists():
+                continue
+            skp = core.open_skp(src)
+            out = self.tmp / (src.stem + ".3mf")
+            write_3mf(core.model_of(skp), instanced_scene.build_instanced_scene(skp._parsed), out,
+                      warn=lambda _t: None)
+            with zipfile.ZipFile(out) as zf:
+                doc = etree.fromstring(zf.read("3D/3dmodel.model"))
+            self.assertTrue(schema.validate(doc), (src.name, str(schema.error_log)[:500]))
+
+    @unittest.skipUnless(PRUSA, "PrusaSlicer nicht gefunden (SKPTOOL_PRUSASLICER)")
+    def test_prusaslicer(self):
+        data = self.tmp / "prusa-daten"
+        code, text = self.run_prog([PRUSA, "--datadir", str(data), "--info", str(self.out)], self.tmp)
+        self.assertEqual(code, 0, text)
+        objs = _info(text)
+        self.assertEqual(len(objs), 7, text)  # PrusaSlicer macht aus jeder Platzierung ein Objekt
+        self.assertTrue(all(o["manifold"] == "yes" for o in objs), text)
+        groesster = max(objs, key=lambda o: float(o["size_x"]))
+        self.assertEqual([round(float(groesster[k]), 3) for k in ("size_x", "size_y", "size_z")],
+                         [1000.0, 1000.0, 1000.0])  # Millimeter, keine Umrechnung
+        stl = self.tmp / "prusa.stl"
+        code, text = self.run_prog([PRUSA, "--datadir", str(data), "--export-stl", "--merge", "--dont-arrange",
+                                    "--no-ensure-on-bed", str(self.out), "--output", str(stl)], self.tmp)
+        self.assertEqual(code, 0, text)
+        self.assert_gleiche_geometrie(stl)
+
+    @unittest.skipUnless(ORCA, "OrcaSlicer nicht gefunden (SKPTOOL_ORCASLICER)")
+    def test_orcaslicer(self):
+        data = self.tmp / "orca-daten"
+        code, text = self.run_prog([ORCA, "--datadir", str(data), "--info", str(self.out)], self.tmp)
+        self.assertEqual(code, 0, text)
+        objs = _info(text)
+        self.assertEqual(len(objs), 1, text)  # OrcaSlicer laedt die Baugruppe als ein Objekt
+        self.assertEqual(objs[0]["number_of_parts"], "7")
+        self.assertEqual([round(float(objs[0][k]), 3) for k in ("size_x", "size_y", "size_z")],
+                         [round(float(x), 3) for x in self.soll["size_mm"]])
+        # --arrange 0 --orient 0: sonst dreht und verteilt OrcaSlicer die Teile. Den Ausgabeordner muss es
+        # geben, sonst bricht OrcaSlicer 2.4.2 ohne Meldung mit 0xE06D7363 ab.
+        (self.tmp / "orca").mkdir()
+        code, text = self.run_prog([ORCA, "--datadir", str(data), "--arrange", "0", "--orient", "0",
+                                    "--export-stl", "--outputdir", str(self.tmp / "orca"), str(self.out)], self.tmp)
+        self.assertEqual(code, 0, text)
+        stl = next((self.tmp / "orca").rglob("*.stl"))
+        self.assert_gleiche_geometrie(stl)
 
 
 if __name__ == "__main__":

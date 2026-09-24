@@ -19,6 +19,17 @@ Umlaufrichtung selbst korrigiert. Darauf verlassen wir uns nicht. Solche Platzie
 auf eine gespiegelte Variante des Netzes (z gespiegelt, Umlauf umgedreht) mit einer Matrix
 positiver Determinante. Das Ergebnis ist bei jedem Leser gleich.
 
+Netz-Objekte liegen um die Mitte ihres Huellquaders, die Verschiebung steckt in der Matrix der
+Platzierung (siehe centered). Das umgeht einen Fehler in OrcaSlicer/Bambu Studio bei gedrehten
+Platzierungen mehrfach benutzter Netze.
+
+Geprueft mit PrusaSlicer 2.9.6, OrcaSlicer 2.4.2, lib3mf 2.5.0 (strenger Modus) und den XSD der
+3MF-Core-Spezifikation. PrusaSlicer macht aus jeder Platzierung ein eigenes Objekt; beruehren sich
+Teile, fragt es beim Oeffnen, ob es ein Objekt aus mehreren Teilen sein soll ("Multi-part object
+detected"). Nur mit "Ja" bleiben die Teile in ihrer Lage zueinander, sonst setzt es jedes Teil
+einzeln auf die Druckplatte. Flache Teile ohne Volumen entfernt es mit einem Hinweis.
+OrcaSlicer laedt die Baugruppe als ein Objekt.
+
 Rueckseiten: OpenSKP gibt Flaechen mit verschiedenen Farben vorne und hinten zweimal aus (die
 Rueckseite umgekehrt gewunden). Fuer den Druck ergaebe das zwei deckungsgleiche Huellen ohne
 Volumen, deshalb bleibt je Flaeche nur die Vorderseite (siehe drop_back_sides). Die 3MF hat daher
@@ -279,12 +290,33 @@ def _problem_text(name: str, chk: dict) -> str | None:
     return f"3MF-Objekt {name!r} ist nicht druckfertig geschlossen: " + ", ".join(parts)
 
 
+VERT_DIGITS = 4  # Nachkommastellen der Punkte (mm): 0,1 Mikrometer
+
+
+def centered(verts: np.ndarray):
+    """Punkte so verschieben, dass die Mitte ihres Huellquaders im Ursprung liegt.
+    Rueckgabe (Punkte gerundet wie in der Datei, Mitte c). Die Platzierung bekommt c als
+    zusaetzliche Verschiebung (t + L c), die Weltlage bleibt gleich.
+
+    Warum: OrcaSlicer 2.4 (und Bambu Studio, gleicher Leser) verschiebt jede weitere Platzierung
+    eines mehrfach benutzten Netzes nach dem Anwenden der Matrix noch einmal um die unrotierte
+    Mitte des Netzes. Gedrehte oder skalierte Platzierungen landen dort sonst neben der richtigen
+    Stelle. Liegt die Mitte schon im Ursprung, ist diese Verschiebung null. Nebenbei bleiben die
+    Koordinaten klein, Slicer rechnen intern mit float32 (bei 46 m Abstand zum Ursprung nur noch
+    auf etwa 4 Mikrometer genau)."""
+    rounded = np.round(verts, VERT_DIGITS)
+    if not len(rounded):
+        return rounded, np.zeros(3)
+    c = np.round((rounded.min(axis=0) + rounded.max(axis=0)) / 2.0, VERT_DIGITS)
+    return np.round(rounded - c, VERT_DIGITS), c
+
+
 def _mesh_xml(obj_id: int, name: str, verts, tris, mats, pid: int) -> list[str]:
     default = int(mats[0]) if len(mats) else 0
     head = (f'<object id="{obj_id}" type="model" name="{xml_attr(name)}" pid="{pid}" pindex="{default}">'
             "<mesh><vertices>")
     out = [head]
-    rounded = np.round(verts, 4).tolist()
+    rounded = np.round(verts, VERT_DIGITS).tolist()
     out += [f'<vertex x="{_num(x)}" y="{_num(y)}" z="{_num(z)}"/>' for x, y, z in rounded]
     out.append("</vertices><triangles>")
     for (v1, v2, v3), m in zip(tris.tolist(), mats.tolist()):
@@ -341,7 +373,7 @@ def write_3mf(model, isc, out: Path, max_components: int = 5_000_000, warn=None)
         def warn(text):
             print(f"Hinweis: {text}", file=sys.stderr, flush=True)
 
-    materials = _material_names(model, isc, textures=False)
+    materials = _material_names(model, isc, textures=False, fallback_names=True)
     placements = _placements(isc, max_components)
     if not placements:
         raise ValueError("Keine Flaechen im Modell, 3MF braucht mindestens ein Netz. Nichts geschrieben.")
@@ -418,14 +450,16 @@ def write_3mf(model, isc, out: Path, max_components: int = 5_000_000, warn=None)
                 stats["mirrored_variants"] += 1
             if len(mats) and (mats.min() < 0 or mats.max() >= max(len(materials), 1)):
                 raise ValueError(f"Netz {res_id}: Materialindex ausserhalb der Materialliste")
+            verts, center = centered(verts)
             chunks += _mesh_xml(next_id, name, verts, tris, mats, base_pid)
-            objects[key] = (next_id, len(tris))
+            objects[key] = (next_id, len(tris), center)
             stats["mesh_objects"] += 1
             stats["triangles"] += len(tris)
             next_id += 1
-        obj_id, ntris = objects[key]
+        obj_id, ntris, center = objects[key]
         if mirrored:
             lin = lin @ _MIRROR  # Netz ist schon gespiegelt, Matrix bekommt positive Determinante
+        t = t + lin @ center  # Netz liegt um seine Mitte, siehe centered()
         ident = np.allclose(lin, np.eye(3), rtol=0, atol=1e-12) and np.allclose(t, 0, rtol=0, atol=1e-9)
         tr = "" if ident else f' transform="{_transform(lin, t)}"'
         components.append(f'<component objectid="{obj_id}"{tr}/>')

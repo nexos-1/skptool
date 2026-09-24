@@ -379,6 +379,53 @@ def _check_usd(path, rep):
             rep.blocking.append(a[:200])
 
 
+# ---------------------------------------------------------------- PLY (angekuendigte Groessen)
+
+_PLY_BYTES = {"char": 1, "uchar": 1, "int8": 1, "uint8": 1, "short": 2, "ushort": 2, "int16": 2, "uint16": 2,
+              "int": 4, "uint": 4, "int32": 4, "uint32": 4, "float": 4, "float32": 4, "double": 8, "float64": 8}
+_PLY_HEAD_MAX = 1 << 20
+
+
+def _check_ply(path):
+    """Blenders PLY-Import reserviert Speicher nach den Anzahlen im Kopf, bevor er die Daten liest:
+    ein 200-Byte-Kopf mit "element vertex 700000000" zog so ueber 9 GB. Hier wird vorher geprueft,
+    ob die angekuendigten Elemente in die Datei passen koennen (jede Zeile braucht mindestens so
+    viele Bytes wie ihre Eigenschaften, im Textformat zwei je Eigenschaft wie "0 ")."""
+    name = os.path.basename(path)
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        head = fh.read(_PLY_HEAD_MAX)
+    m = re.search(rb"(?m)^end_header[ \t]*\r?\n", head)
+    if not head.startswith(b"ply") or m is None:
+        raise RefError(f"{name} ist keine lesbare PLY-Datei (Kopf fehlt oder ist laenger als 1 MB)")
+    body = size - m.end()
+    binary = None
+    elements = []  # [Anzahl, Mindestbytes je Zeile]
+    for line in head[:m.start()].decode("latin-1").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "format" and len(parts) >= 2:
+            binary = parts[1] != "ascii"
+        elif parts[0] == "element":
+            if len(parts) < 3 or not parts[2].isdigit():
+                raise RefError(f"{name}: ungueltige Elementangabe im PLY-Kopf: {line[:80]}")
+            elements.append([int(parts[2]), 0])
+        elif parts[0] == "property" and elements:
+            if len(parts) >= 3 and parts[1] == "list":
+                elements[-1][1] += _PLY_BYTES.get(parts[2], 1) if binary else 2  # leere Liste: nur die Anzahl
+            elif len(parts) >= 2:
+                elements[-1][1] += _PLY_BYTES.get(parts[1], 1) if binary else 2
+    if binary is None:
+        raise RefError(f"{name}: PLY-Kopf ohne format-Zeile")
+    need = sum(n * max(row, 1) for n, row in elements)
+    if need > max(body, 0):
+        total = sum(n for n, _ in elements)
+        raise RefError(f"{name} kuendigt {total} Elemente an, dafuer ist die Datei mit {size} Byte viel zu "
+                       "klein (beschaedigt oder praepariert). Nicht geladen, sonst reserviert Blender dafuer "
+                       "Speicher")
+
+
 # ---------------------------------------------------------------- Einstieg
 
 def precheck(path, allow_external=False):
@@ -405,12 +452,14 @@ def _precheck(path, allow_external):
         _check_obj(path, rep)
     elif ext in (".usd", ".usda", ".usdc", ".usdz"):
         _check_usd(path, rep)
+    elif ext == ".ply":
+        _check_ply(path)
     elif ext in (".fbx", ".abc", ".dae"):
         with open(path, "rb") as fh:
             for hit in _scan_stream(fh, _UNC_LOOSE):
                 if classify(hit) == "network":
                     rep.network.append(hit[:200])
-    # .stl, .ply: keine Verweise
+    # .stl: keine Verweise; .ply: keine Verweise, aber angekuendigte Groessen (oben)
     if rep.network:
         raise RefError("Die Datei verweist auf Netzwerkpfade und wird aus Sicherheitsgruenden nicht "
                        "geoeffnet (schon der Zugriff wuerde Anmeldedaten an fremde Server senden): "

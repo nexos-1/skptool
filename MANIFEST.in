@@ -1,0 +1,7 @@
+# Quellarchiv (sdist): nur Paket, README, LICENSE und pyproject.toml. Tests brauchen samples/ und
+# gehoeren ins Repository, nicht ins Paket.
+prune tests
+prune samples
+prune intern
+prune tools
+prune docs

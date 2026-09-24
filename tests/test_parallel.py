@@ -53,6 +53,19 @@ def prozesse_mit(text: str) -> list[str]:
                            text=True, encoding="utf-8", errors="replace", timeout=300,
                            env=dict(os.environ, SKPTOOL_SUCHE=text))
         return [z for z in r.stdout.splitlines() if z.strip()]
+    if not shutil.which("ps") and os.path.isdir("/proc"):  # schlanke Linux-Container haben kein ps
+        zeilen = []
+        for eintrag in os.listdir("/proc"):
+            if not eintrag.isdigit() or int(eintrag) == os.getpid():
+                continue
+            try:
+                with open(f"/proc/{eintrag}/cmdline", "rb") as fh:
+                    befehl = fh.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+            except OSError:
+                continue
+            if befehl and text in befehl:  # Zombies haben eine leere Befehlszeile
+                zeilen.append(f"{eintrag} {befehl}")
+        return zeilen
     r = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=60)
     return [z for z in r.stdout.splitlines() if text in z and "ps -eo" not in z]
 
@@ -74,7 +87,15 @@ def lebt(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    try:  # Zombie (beendet, noch nicht abgeholt) zaehlt nicht
+    if os.path.isdir("/proc/self"):  # Linux: Zustand aus /proc (auch ohne ps); Zombie zaehlt nicht
+        try:
+            with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as fh:
+                return fh.read().rpartition(")")[2].split()[0] != "Z"
+        except FileNotFoundError:
+            return False  # inzwischen weg
+        except (OSError, IndexError):
+            return True
+    try:  # macOS: Zombie (beendet, noch nicht abgeholt) zaehlt nicht
         return "Z" not in subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
                                          text=True).stdout
     except OSError:
@@ -156,6 +177,67 @@ class TestSpeicherwaechter(unittest.TestCase):
             p.write_text("MemTotal: 16000000 kB\nMemFree: 1000 kB\nBuffers: 2000 kB\nCached: 3000 kB\n",
                          encoding="ascii")
             self.assertEqual(stapel._frei_linux(str(p)), 6000 * 1024)
+
+    def test_cgroup_grenze_im_container(self):
+        """Linux im Container: /proc/meminfo zeigt den ganzen Rechner, die Grenze steht in der cgroup.
+        Gefunden bei der Linux-Pruefung in Docker (--memory): ohne das plante --jobs auto nach dem
+        freien Speicher des Rechners statt nach der Grenze des Containers."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            selbst = tmp / "cgroup_self"
+
+            def datei(pfad, text):
+                pfad.parent.mkdir(parents=True, exist_ok=True)
+                pfad.write_text(text, encoding="ascii")
+
+            # v2 mit eigenem Namensraum: eigene cgroup ist die Wurzel des Mounts
+            v2 = tmp / "v2"
+            datei(selbst, "0::/\n")
+            datei(v2 / "memory.max", "2147483648\n")
+            datei(v2 / "memory.current", str(700 * MB) + "\n")
+            datei(v2 / "memory.stat", f"anon 1000\nfile 5000\ninactive_file {200 * MB}\nactive_file 7\n")
+            self.assertEqual(stapel._frei_cgroup(str(v2), str(selbst)), 2 * GB - 500 * MB)
+            # keine Grenze
+            datei(v2 / "memory.max", "max\n")
+            self.assertIsNone(stapel._frei_cgroup(str(v2), str(selbst)))
+            # v2 unter systemd: eine uebergeordnete cgroup hat die engere Grenze
+            datei(selbst, "0::/user.slice/app.scope\n")
+            datei(v2 / "user.slice" / "memory.max", str(1 * GB))
+            datei(v2 / "user.slice" / "memory.current", str(100 * MB))
+            datei(v2 / "user.slice" / "app.scope" / "memory.max", str(4 * GB))
+            datei(v2 / "user.slice" / "app.scope" / "memory.current", str(50 * MB))
+            self.assertEqual(stapel._frei_cgroup(str(v2), str(selbst)), 1 * GB - 100 * MB)
+            # belegt ueber der Grenze: 0, nie negativ
+            datei(v2 / "user.slice" / "memory.current", str(2 * GB))
+            self.assertEqual(stapel._frei_cgroup(str(v2), str(selbst)), 0)
+            # Pfad mit .. (ausserhalb des Namensraums): nur die Wurzel zaehlt
+            datei(selbst, "0::/../../fremd\n")
+            self.assertIsNone(stapel._frei_cgroup(str(v2), str(selbst)))
+
+            # v1 ohne cgroup-Namensraum: /proc/self/cgroup nennt den Pfad des Rechners, im Mount ist die
+            # eigene cgroup aber die Wurzel
+            v1 = tmp / "v1"
+            datei(selbst, "12:cpu,cpuacct:/docker/abc\n11:memory:/docker/abc\n0::/system.slice/x\n")
+            datei(v1 / "memory" / "memory.limit_in_bytes", str(3 * GB))
+            datei(v1 / "memory" / "memory.usage_in_bytes", str(1 * GB))
+            datei(v1 / "memory" / "memory.stat", f"cache 5\ntotal_inactive_file {256 * MB}\n")
+            self.assertEqual(stapel._frei_cgroup(str(v1), str(selbst)), 2 * GB + 256 * MB)
+            datei(v1 / "memory" / "memory.limit_in_bytes", "9223372036854771712")  # v1: keine Grenze
+            self.assertIsNone(stapel._frei_cgroup(str(v1), str(selbst)))
+            # fehlende oder kaputte Dateien: None statt Fehler
+            self.assertIsNone(stapel._frei_cgroup(str(tmp / "fehlt"), str(tmp / "fehlt_auch")))
+            datei(selbst, "Unsinn\n\n0::\n")
+            self.assertIsNone(stapel._frei_cgroup(str(tmp / "leer"), str(selbst)))
+
+        # unter Linux gilt der kleinere Wert
+        with mock.patch.object(stapel.sys, "platform", "linux"), mock.patch.object(stapel.os, "name", "posix"), \
+                mock.patch.object(stapel, "_frei_linux", return_value=30 * GB), \
+                mock.patch.object(stapel, "_frei_cgroup", return_value=2 * GB):
+            self.assertEqual(stapel.freier_speicher(), 2 * GB)
+        with mock.patch.object(stapel.sys, "platform", "linux"), mock.patch.object(stapel.os, "name", "posix"), \
+                mock.patch.object(stapel, "_frei_linux", return_value=3 * GB), \
+                mock.patch.object(stapel, "_frei_cgroup", return_value=None):
+            self.assertEqual(stapel.freier_speicher(), 3 * GB)
 
 
 class TestJobsSchalter(unittest.TestCase):
