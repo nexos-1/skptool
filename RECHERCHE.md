@@ -52,7 +52,15 @@ Twinmotion und D5 Render importieren `.skp`, exportieren aber keine Geometrie. C
 - **RedHaloStudio/Sketchup_Importer 0.27.0** (Januar 2026) ist das verbreitete Import-Add-on. Es nutzt das offizielle Trimble-SDK, läuft laut Projekt unter Windows und macOS und unterstützt Blender 5.1 und 5.2 sowie Dateien bis SketchUp 2026. Nach den ausgewerteten Quellen importiert es, exportiert aber nicht. Hier nicht selbst getestet.
 - **blender-openskp 0.2.5** vom Autor von OpenSKP importiert und exportiert ohne SDK, auch unter Linux. Es bündelt OpenSKP 1.3.0, das zum Zeitpunkt der Recherche erst wenige Tage alt war. Mit der älteren OpenSKP-Version 1.2.0 bricht der Import ab. `skptool` verwendet nur Paketversionen, die mindestens 14 Tage veröffentlicht sind, und nutzte deshalb zunächst 1.2.0. OpenSKP 1.3.0 hat es erst nach Prüfung von Paket und Quellcode als ausdrückliche Ausnahme übernommen. Das Add-on selbst nutzt `skptool` nicht.
 - **Skp Editor** auf Superhive kostet 16 $ und kann laut Anbieter Import und Export mit Texturen. Nicht getestet.
+- blender-openskp exportiert laut eigener Doku (Stand September 2026) die Geometrie flach und in Dreiecken; Texturen gehen nur als Volltonfarbe zurück, Tags aus Collections ja. Harte und weiche Kanten, Rückseiten und Tönung werden nicht genannt.
 - Auf extensions.blender.org gibt es noch kein SketchUp-Add-on. blender-openskp wartet dort auf Freigabe.
+
+## 4a. KI-Werkzeuge (Nachtrag September 2026)
+
+- **Blender MCP** (ahujasid/blender-mcp) und der Blender-Connector für Claude steuern ein offenes Blender über dessen Python-Schnittstelle. `.skp` lesen oder schreiben sie nicht selbst.
+- **SketchUp-Connector für Claude** (Trimble, seit April 2026): Claude erzeugt aus Text und Bildern neue SketchUp-Modelle und gibt eine `.skp` zum Herunterladen. Ohne SketchUp-Abo 30 Dateien im Monat. Ob bestehende Dateien bearbeitet werden können, ist nicht dokumentiert.
+- Community-Server wie sketchup-mcp brauchen ein laufendes SketchUp (Desktop, Ruby).
+- `skptool` bearbeitet dagegen vorhandene `.skp` ohne SketchUp: über Blender im Live-Modus oder per MCP-Server, und schreibt das Ergebnis mit Struktur zurück.
 
 ## 5. Das offizielle Trimble-SDK
 
@@ -104,6 +112,8 @@ Die Node.js-Variante von OpenSKP (1.2.0, alle Abhängigkeiten älter als 14 Tage
 - IngeTrazo: https://github.com/ingelibre/ingetrazo
 - Pluton: https://github.com/Parrow-Horrizon-Studio/pluton
 - RedHalo Sketchup_Importer: https://github.com/RedHaloStudio/Sketchup_Importer/releases
+- Blender MCP: https://github.com/ahujasid/blender-mcp
+- SketchUp-Connector für Claude: https://www.engineering.com/now-sketchup-has-an-mcp-server-for-claude-based-3d-modeling/
 - SketchUp Free Funktionsumfang: https://sketchup.trimble.com/en/plans-and-pricing/sketchup-free
 - SketchUp Make nicht mehr verfügbar: https://help.sketchup.com/en/make-access
 - SketchUp C API Release Notes: https://extensions.sketchup.com/developers/sketchup_c_api/sketchup/md__sketch_up__c__a_p_i__release__notes.html
