@@ -17,7 +17,7 @@
 ## What it does
 
 - **Converts** `.skp` to glTF, OBJ, STL, PLY, DXF, IFC, JSON, `.blend`, FBX, USD, Alembic and PNG, and from the common Blender formats (`.blend`, glTF, FBX, OBJ, STL, PLY, USD, Alembic) back to `.skp`.
-- **Round trip through Blender:** Components, nested Groups, Tags, Materials, Textures (front and back), Opacity and hard and soft edges are all preserved.
+- **Round trip through Blender:** Components, nested Groups, Tags, per-face Materials, Textures (front and back, with placement and Colorize), Opacity and hard and soft edges are all preserved.
 - **Command-based editing** with a fixed set of operations (move, rotate, scale, paint, copy, delete, ...), no Blender knowledge required.
 - **Live editing** in a running Blender window: commands take effect immediately, and every save writes the `.skp` automatically. Designed for scripts and AI assistants as well.
 - **MCP server** for AI assistants such as Claude: `skptool mcp` exposes reading, comparing, converting, editing and live control as tools.
@@ -25,6 +25,21 @@
 - **3MF for 3D printing**, directly, without Blender.
 - **Rewrites newer files in the 2017 format** so that older programs can open them, including Text, Dimensions and attributes.
 - **Built for untrusted files:** no code execution, no network access, no foreign local files in the output. Details in [SECURITY.en.md](SECURITY.en.md).
+
+## How it compares
+
+Individual pieces exist elsewhere. What, as far as our research shows (September 2026), only `skptool` combines as an open tool: editing an existing `.skp` in Blender or through an AI assistant and saving it back as `.skp` **with its structure**, without SketchUp, without the Trimble SDK and without an account.
+
+| | read `.skp` | write `.skp` | structure back (Components, nesting, Tags) | textures back | AI control | without SketchUp and SDK |
+|---|---|---|---|---|---|---|
+| [OpenSKP](https://github.com/iamahsanmehmood/openskp) (library, the foundation of `skptool`) | yes | yes (2017) | as a library, build it yourself | as a library | no | yes |
+| [blender-openskp](https://github.com/iamahsanmehmood/blender-openskp) (Blender add-on) | yes | yes | Tags yes, geometry flattened and triangulated | no, solid color only | no | yes |
+| [RedHalo Sketchup_Importer](https://github.com/RedHaloStudio/Sketchup_Importer) (Blender add-on) | yes | no | | | no | no, Trimble SDK, no Linux |
+| [Blender MCP](https://github.com/ahujasid/blender-mcp) and the Blender connector for Claude | only through an add-on | no | | | yes, in Blender | |
+| SketchUp connector for Claude (Trimble) | | creates new models | | | yes | no, SketchUp account |
+| **`skptool`** | yes (2013 to 2026) | yes (2017) | yes, including hard and soft edges and back faces | yes, with placement and Colorize | yes: live mode and MCP | yes |
+
+On top of that come things a command line offers and add-ons do not: batch conversion, `diff`, `report` and 3MF with colors for 3D printing. `skptool` would not exist without OpenSKP; the table compares tools, not their quality, and reflects what the projects state, not our own tests (except for `skptool`). More in [RECHERCHE.md](RECHERCHE.md) (German).
 
 ## Installation
 

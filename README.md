@@ -15,7 +15,7 @@
 ## Was es kann
 
 - **Umwandeln** von `.skp` nach glTF, OBJ, STL, PLY, DXF, IFC, JSON, `.blend`, FBX, USD, Alembic und PNG, und aus den gängigen Blender-Formaten (`.blend`, glTF, FBX, OBJ, STL, PLY, USD, Alembic) zurück nach `.skp`.
-- **Rundreise über Blender:** Komponenten, Gruppen in Gruppen, Tags, Materialien, Texturen (vorne und hinten), Deckkraft, harte und weiche Kanten bleiben erhalten.
+- **Rundreise über Blender:** Komponenten, Gruppen in Gruppen, Tags, Materialien je Fläche, Texturen (vorne und hinten, mit Lage und Tönung), Deckkraft, harte und weiche Kanten bleiben erhalten.
 - **Bearbeiten per Befehl** mit einer festen Liste von Operationen (verschieben, drehen, skalieren, einfärben, kopieren, löschen, ...), ohne Blender-Kenntnisse.
 - **Live-Bearbeitung** im offenen Blender-Fenster: Befehle wirken sofort, jedes Speichern schreibt automatisch die `.skp`. Gedacht auch für Skripte und KI-Assistenten.
 - **MCP-Server** für KI-Assistenten wie Claude: `skptool mcp` stellt Lesen, Vergleichen, Umwandeln, Bearbeiten und die Live-Steuerung als Werkzeuge bereit.
@@ -23,6 +23,21 @@
 - **3MF für den 3D-Druck**, direkt ohne Blender.
 - **Neue Dateien ins 2017-Format umschreiben**, damit ältere Programme sie öffnen, samt Texten, Bemaßungen und Attributen.
 - **Für fremde Dateien gebaut:** keine Codeausführung, keine Netzwerkzugriffe, keine fremden lokalen Dateien in der Ausgabe. Details in [SECURITY.md](SECURITY.md).
+
+## Einordnung
+
+Einzelne Teile gibt es auch anderswo. Was `skptool` nach unserer Recherche (Stand September 2026) als einziges offenes Werkzeug verbindet: eine vorhandene `.skp` in Blender oder von einem KI-Assistenten bearbeiten lassen und **mit ihrer Struktur** wieder als `.skp` speichern, ohne SketchUp, ohne Trimble-SDK und ohne Konto.
+
+| | `.skp` lesen | `.skp` schreiben | Struktur zurück (Komponenten, Verschachtelung, Tags) | Texturen zurück | KI-Steuerung | ohne SketchUp und SDK |
+|---|---|---|---|---|---|---|
+| [OpenSKP](https://github.com/iamahsanmehmood/openskp) (Bibliothek, Grundlage von `skptool`) | ja | ja (2017) | als Bibliothek, selbst zu bauen | als Bibliothek | nein | ja |
+| [blender-openskp](https://github.com/iamahsanmehmood/blender-openskp) (Blender-Add-on) | ja | ja | Tags ja, Geometrie flach und in Dreiecken | nein, nur Volltonfarbe | nein | ja |
+| [RedHalo Sketchup_Importer](https://github.com/RedHaloStudio/Sketchup_Importer) (Blender-Add-on) | ja | nein | | | nein | nein, Trimble-SDK, kein Linux |
+| [Blender MCP](https://github.com/ahujasid/blender-mcp) und der Blender-Connector für Claude | nur über ein Add-on | nein | | | ja, in Blender | |
+| SketchUp-Connector für Claude (Trimble) | | erzeugt neue Modelle | | | ja | nein, SketchUp-Konto |
+| **`skptool`** | ja (2013 bis 2026) | ja (2017) | ja, auch harte und weiche Kanten und Rückseiten | ja, mit Lage und Tönung | ja: Live-Modus und MCP | ja |
+
+Dazu kommt, was es als Kommandozeile gibt und bei Add-ons nicht: Stapelbetrieb, `diff`, `report` und 3MF mit Farben für den 3D-Druck. Ohne OpenSKP gäbe es `skptool` nicht; die Tabelle vergleicht Werkzeuge, nicht deren Qualität, und gibt die Angaben der Projekte wieder, nicht eigene Tests (außer für `skptool`). Mehr dazu in [RECHERCHE.md](RECHERCHE.md).
 
 ## Installation
 
