@@ -89,9 +89,12 @@ class RunnerTest(unittest.TestCase):
     def test_projektordner_starter_und_python(self):
         proj = fake_project(self.tmp / "proj")
         py = venv_python(proj)
-        launcher = proj / ("skptool.cmd" if WINDOWS else "skptool")
-        launcher.write_text("@echo off\n")
-        for setting in (proj, launcher, py):
+        settings = [proj, py]
+        if WINDOWS:  # unter Linux/macOS ist proj/skptool der Paketordner, dort gibt es keinen Starter
+            launcher = proj / "skptool.cmd"
+            launcher.write_text("@echo off\n")
+            settings.insert(1, launcher)
+        for setting in settings:
             cmd = runner.resolve(str(setting))
             self.assertEqual(cmd.argv, [str(py), "-P", "-m", "skptool"], setting)
             self.assertEqual(cmd.env_extra, {"PYTHONPATH": str(proj)}, setting)

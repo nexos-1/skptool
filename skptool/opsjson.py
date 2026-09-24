@@ -53,8 +53,12 @@ def load_ops(raw: str, stdin=None) -> list:
             raise SystemExit(f"--ops -: stdin ist leer, erwartet wird eine Liste wie {EXAMPLE}")
     elif text[0] not in "[{":
         path = Path(raw)
-        if not path.is_file():
-            raise SystemExit(f"--ops: Datei nicht gefunden (oder keine normale Datei): {raw}")
+        try:
+            ist_datei = path.is_file()
+        except OSError:  # unter Linux/macOS z. B. ENAMETOOLONG, das is_file nicht selbst abfaengt
+            ist_datei = False
+        if not ist_datei:
+            raise SystemExit(f"--ops: Datei nicht gefunden (oder keine normale Datei): {raw[:200]}")
         if path.stat().st_size > MAX_BYTES:
             raise SystemExit(f"--ops: Datei ist groesser als {MAX_BYTES // 2**20} MB")
         with path.open("rb") as fh:
