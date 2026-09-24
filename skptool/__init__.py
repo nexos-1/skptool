@@ -2,7 +2,7 @@
 import os as _os
 import sys as _sys
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 
 def _suchpfad_haerten():

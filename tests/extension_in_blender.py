@@ -95,9 +95,42 @@ def main():
         ob.select_set(False)
     res["export_empty_sel"] = call(bpy.ops.export_scene.skptool_skp, filepath=os.path.join(out, "leer.skp"),
                                    use_selection=True)
+    repeated_import(job, out, res)
     res["leftover_temp_dirs"] = sorted(temp_dirs() - tmp_before)
     res["is_dirty_file_path"] = bpy.data.filepath
     print(PREFIX + json.dumps(res), flush=True)
+
+
+def data_state():
+    sc = bpy.context.scene
+    return {**scene_state(),
+            "all_collections": sorted(c.name for c in bpy.data.collections),
+            "all_materials": sorted(m.name for m in bpy.data.materials),
+            "all_meshes": sorted(m.name for m in bpy.data.meshes),
+            "per_collection": {c.name: len(c.objects) for c in sc.collection.children_recursive}}
+
+
+def repeated_import(job, out, res):
+    """Dieselbe Datei (mit Objekten auf den Tags Chair und Table) mehrmals in eine leere Szene."""
+    for ob in list(bpy.data.objects):
+        bpy.data.objects.remove(ob)
+    for coll in (bpy.data.collections, bpy.data.meshes, bpy.data.materials, bpy.data.images):
+        for idb in list(coll):
+            if idb.name not in ("Render Result", "Viewer Node"):
+                coll.remove(idb)
+    res["empty_before_twice"] = data_state()
+    res["import_twice"] = [call(bpy.ops.import_scene.skptool_skp, filepath=job["skp_tags"]) for _ in range(2)]
+    res["after_twice"] = data_state()
+    res["export_twice"] = call(bpy.ops.export_scene.skptool_skp, filepath=os.path.join(out, "doppelt.skp"))
+    # Material in der Szene umfaerben: der dritte Import bringt das alte Walnut mit, das jetzt
+    # anders aussieht. Es bleibt ein eigenes Material (Blender: "Walnut.001", SketchUp: "Walnut_2").
+    walnut = bpy.data.materials["Walnut"]
+    node = next(n for n in walnut.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
+    node.inputs["Base Color"].default_value = (1.0, 0.0, 0.0, 1.0)
+    walnut.diffuse_color = (1.0, 0.0, 0.0, 1.0)
+    res["import_third"] = call(bpy.ops.import_scene.skptool_skp, filepath=job["skp_tags"])
+    res["after_third"] = data_state()
+    res["export_third"] = call(bpy.ops.export_scene.skptool_skp, filepath=os.path.join(out, "dreifach.skp"))
 
 
 try:
