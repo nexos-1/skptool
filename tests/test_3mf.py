@@ -26,7 +26,8 @@ from defusedxml import ElementTree as SafeET
 from openskp import instanced_scene
 
 from skptool import cli, core
-from skptool.export_3mf import drop_back_sides, write_3mf, _welded_mesh
+from skptool.export_3mf import (MAX_FILAMENTE, _welded_mesh, drop_back_sides, filamente, paint_code,
+                                write_3mf)
 from skptool.gltf_writer import write_instanced_glb
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,8 @@ S2026 = SAMPLES / "extern" / "gross_2026.skp"
 EXTERN_HINT = "Beispieldatei fehlt, laden mit: python tools/beispiele_laden.py"
 
 NS = {"m": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"}
+SLIC3RPE = "http://schemas.slic3r.org/3mf/2017/06"
+MMU = "{%s}mmu_segmentation" % SLIC3RPE
 CT_NS = "{http://schemas.openxmlformats.org/package/2006/content-types}"
 REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 ST_NUMBER = re.compile(r"^((\-|\+)?(([0-9]+(\.[0-9]+)?)|(\.[0-9]+))((e|E)(\-|\+)?[0-9]+)?)$")
@@ -450,6 +453,225 @@ class Test3mfLage(Base):
         np.testing.assert_allclose(np.ptp(grau[0]["verts"], axis=0), [1000.0, 1000.0, 1000.0])
 
 
+# ---------------------------------------------------------------- Farben fuer die Slicer
+
+def paint_zustand(code):
+    """Bemalung eines ungeteilten Dreiecks zurueckrechnen, unabhaengig vom Schreiber nach
+    PrusaSlicers FacetsAnnotation::set_triangle_from_string und TriangleSelector::deserialize:
+    Hex-Ziffern von hinten, je Ziffer 4 Bit (niedrigstes zuerst); 2 Bit geteilte Seiten (hier 0),
+    2 Bit Zustand, bei 0b11 folgen 4 Bit (Zustand - 3)."""
+    bits = []
+    for ch in reversed(code):
+        d = int(ch, 16)
+        bits += [(d >> i) & 1 for i in range(4)]
+    assert bits[0] == 0 and bits[1] == 0, f"Dreieck als geteilt markiert: {code}"
+    s = bits[2] | (bits[3] << 1)
+    if s < 3:
+        return s
+    n = sum(bits[4 + i] << i for i in range(4))
+    assert n != 0b1110, "erweiterter Zustand ueber 16"
+    return n + 3
+
+
+def farbmodell(path, textur=None):
+    """Wuerfel 40 mm mit sechs verschiedenen Seitenfarben (ein Netz, mehrere Farben) und eine Komponente
+    Klotz (20 mm, orange) zweimal, einmal gedreht. textur: PNG-Pfad, dann ist die Oberseite ein
+    Texturmaterial (mit falschem Platzhalter als Durchschnittsfarbe)."""
+    b = core.create()
+    farben = {"Rot": [220, 30, 30], "Gruen": [30, 180, 60], "Blau": [30, 60, 220], "Gelb": [240, 210, 20],
+              "Weiss": [250, 250, 250], "Schwarz": [20, 20, 20], "Orange": [255, 128, 0]}
+    m = {k: b.add_material(k, v) for k, v in farben.items()}
+    if textur is not None:
+        m["Weiss"] = b.add_texture_material("Holz", str(textur))
+        core.set_texture_average_color(b, (255, 255, 255))
+
+    def wuerfel(add, s, mats):
+        p = [(x * s, y * s, z * s) for x, y, z in
+             [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]]
+        for q, mat in zip([(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)], mats):
+            add([p[i] for i in q], material=mat)
+
+    s = 40 / ZOLL
+    with b.add_component_definition("Klotz") as k:
+        wuerfel(k.add_face, s / 2, [m["Orange"]] * 6)
+    wuerfel(b.add_face, s, [m["Schwarz"], m["Weiss"], m["Rot"], m["Gruen"], m["Blau"], m["Gelb"]])
+    b.add_instance(k, name="k1", translation=(2 * s, 0.0, 0.0))
+    b.add_instance(k, name="k2", translation=(2 * s, s, 0.0), rotation=((0, 0, 1), math.radians(30)))
+    core.save_atomic(b, path)
+    return path
+
+
+def muster_png(path):
+    """16x16-Verlauf; Durchschnitt (abgerundet) 112, 112, 125."""
+    from PIL import Image
+    x, y = np.meshgrid(np.arange(16), np.arange(16))
+    Image.fromarray(np.stack([x * 15, y * 15, (x + y) * 7 + 20], -1).astype(np.uint8), "RGB").save(path)
+    return path
+
+
+def lies_farben(path):
+    """Farbteile einer 3MF: Farbe je platziertem Dreieck (basematerials), Bemalung je Dreieck,
+    Slicer-Dateien und Inhaltstypen."""
+    with zipfile.ZipFile(path) as zf:
+        teile = {n: zf.read(n) for n in zf.namelist()}
+    model = SafeET.fromstring(teile["3D/3dmodel.model"])
+    farben = [b.get("displaycolor") for b in model.iterfind("m:resources/m:basematerials/m:base", NS)]
+    tris = {}  # objekt-id -> [(farbe #RRGGBB, bemalung oder None)]
+    for obj in model.iterfind("m:resources/m:object", NS):
+        if obj.find("m:mesh", NS) is None:
+            continue
+        default = int(obj.get("pindex"))
+        tris[obj.get("id")] = [(farben[int(t.get("p1", default))][:7], t.get(MMU))
+                               for t in obj.iterfind("m:mesh/m:triangles/m:triangle", NS)]
+    comps = [c.get("objectid") for c in model.iterfind("m:resources/m:object/m:components/m:component", NS)]
+    ct = SafeET.fromstring(teile["[Content_Types].xml"])
+    defaults = {d.get("Extension"): d.get("ContentType") for d in ct.iter(CT_NS + "Default")}
+    overrides = {o.get("PartName"): o.get("ContentType") for o in ct.iter(CT_NS + "Override")}
+    return {"teile": teile, "model": model, "farben": farben, "tris": tris, "komponenten": comps,
+            "item": model.find("m:build/m:item", NS).get("objectid"), "defaults": defaults,
+            "overrides": overrides}
+
+
+def prusa_ini(text):
+    return dict(re.findall(r"^; (\w+) = (.*)$", text, flags=re.M))
+
+
+class Test3mfFarben(Base):
+    """Farben fuer PrusaSlicer (Bemalung + Slic3r_PE.config) und OrcaSlicer (Teile + project_settings)."""
+
+    def schreiben(self, src, warn=None):
+        skp = core.open_skp(src)
+        out = self.tmp / (Path(src).stem + ".3mf")
+        st = write_3mf(core.model_of(skp), instanced_scene.build_instanced_scene(skp._parsed), out,
+                       warn=warn or (lambda _t: None))
+        return st, out
+
+    def test_bemalungscode_wie_prusaslicer(self):
+        self.assertEqual([paint_code(k) for k in (1, 2, 3, 4, 16)], ["4", "8", "0C", "1C", "DC"])
+        for k in range(1, MAX_FILAMENTE + 1):
+            self.assertEqual(paint_zustand(paint_code(k)), k)
+        for falsch in (0, MAX_FILAMENTE + 1):
+            with self.assertRaises(ValueError):
+                paint_code(falsch)
+
+    def test_filamente_nach_flaeche_und_zusammengefasst(self):
+        flaechen = {"#FF0000": 10.0, "#00FF00": 30.0, "#0000FF": 30.0, "#FE0101": 1.0, "#0000F0": 2.0}
+        zuerst = {"#FF0000": 0, "#0000FF": 1, "#00FF00": 2, "#FE0101": 3, "#0000F0": 4}
+        farben, nummer = filamente(flaechen, zuerst, limit=3)
+        self.assertEqual(farben, ["#0000FF", "#00FF00", "#FF0000"])  # gleiche Flaeche: frueher gesehen zuerst
+        self.assertEqual(nummer["#FE0101"], 3)  # naechste behaltene Farbe: Rot
+        self.assertEqual(nummer["#0000F0"], 1)  # Blau
+        self.assertEqual(filamente(flaechen, zuerst, limit=3), (farben, nummer))
+
+    def test_farben_je_dreieck_und_slicer_dateien(self):
+        st, out = self.schreiben(farbmodell(self.tmp / "farben.skp"))
+        got = lies_farben(out)
+        erwartet = ["#FF8000", "#141414", "#FAFAFA", "#DC1E1E", "#1EB43C", "#1E3CDC", "#F0D214"]
+        self.assertEqual(st["filaments"], erwartet)  # Orange: groesste Flaeche (zwei Kloetze), dann Reihenfolge
+        self.assertEqual(st["colors"], 7)
+        self.assertEqual(st["colors_merged"], 0)
+
+        # PrusaSlicer: jedes Dreieck bemalt, Filament = seine Farbe
+        self.assertIn(f'xmlns:slic3rpe="{SLIC3RPE}"', got["teile"]["3D/3dmodel.model"].decode())
+        for tris in got["tris"].values():
+            for farbe, code in tris:
+                self.assertIsNotNone(code)
+                self.assertEqual(erwartet[paint_zustand(code) - 1], farbe)
+        ini = prusa_ini(got["teile"]["Metadata/Slic3r_PE.config"].decode())
+        self.assertEqual(ini["filament_colour"].split(";"), erwartet)
+        self.assertEqual(ini["extruder_colour"], ini["filament_colour"])
+        self.assertEqual(len(ini["nozzle_diameter"].split(",")), 7)
+        self.assertEqual(len(ini["filament_diameter"].split(",")), 7)
+
+        # OrcaSlicer: Farben im Projekt, je Teil (Komponente) das Filament der Hauptfarbe
+        proj = json.loads(got["teile"]["Metadata/project_settings.config"])
+        self.assertEqual(proj["filament_colour"], erwartet)
+        self.assertEqual(len(proj["filament_diameter"]), 7)
+        self.assertEqual(len(proj["filament_is_support"]), 7)
+        ms = SafeET.fromstring(got["teile"]["Metadata/model_settings.config"])
+        objs = ms.findall("object")
+        self.assertEqual([o.get("id") for o in objs], [got["item"]])
+        teile = objs[0].findall("part")
+        self.assertEqual([p.get("id") for p in teile], got["komponenten"])
+        for p in teile:
+            meta = {m.get("key"): m.get("value") for m in p.findall("metadata")}
+            farben = [f for f, _c in got["tris"][p.get("id")]]
+            je = {f: farben.count(f) for f in farben}  # alle Dreiecke hier gleich gross je Netz
+            haupt = min(je, key=lambda f: (-je[f], erwartet.index(f)))
+            self.assertEqual(meta["extruder"], str(erwartet.index(haupt) + 1), meta)
+        self.assertEqual(sorted(p.find("metadata[@key='extruder']").get("value") for p in teile), ["1", "1", "2"])
+
+        # jedes Teil hat einen Inhaltstyp
+        for name in got["teile"]:
+            if name == "[Content_Types].xml":
+                continue
+            self.assertTrue(name.rsplit(".", 1)[-1] in got["defaults"] or "/" + name in got["overrides"], name)
+        self.assertEqual(got["overrides"]["/Metadata/project_settings.config"], "application/json")
+
+        # gleiche Eingabe, gleiche Bytes
+        again = self.tmp / "nochmal" / out.name
+        skp = core.open_skp(self.tmp / "farben.skp")
+        write_3mf(core.model_of(skp), instanced_scene.build_instanced_scene(skp._parsed), again, warn=lambda _t: None)
+        self.assertEqual(out.read_bytes(), again.read_bytes())
+
+    def test_einfarbig_ohne_slicer_dateien(self):
+        b = core.create()
+        grau = b.add_material("Grau", [150, 150, 150])
+        s = 10 / ZOLL
+        p = [(x * s, y * s, z * s) for x, y, z in
+             [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]]
+        for q in [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]:
+            b.add_face([p[i] for i in q], material=grau)
+        core.save_atomic(b, self.tmp / "grau.skp")
+        st, out = self.schreiben(self.tmp / "grau.skp")
+        got = lies_farben(out)
+        self.assertEqual(st["colors"], 1)
+        self.assertEqual(st["filaments"], [])
+        self.assertEqual(sorted(got["teile"]), ["3D/3dmodel.model", "[Content_Types].xml", "_rels/.rels"])
+        self.assertNotIn("slic3rpe", got["teile"]["3D/3dmodel.model"].decode())
+        self.assertEqual(got["overrides"], {})
+
+    def test_textur_bekommt_durchschnittsfarbe(self):
+        st, out = self.schreiben(farbmodell(self.tmp / "textur.skp", textur=muster_png(self.tmp / "m.png")))
+        got = lies_farben(out)
+        names = [b.get("name") for b in got["model"].iterfind("m:resources/m:basematerials/m:base", NS)]
+        self.assertEqual(got["farben"][names.index("Holz")], "#70707D")  # Bild, nicht der weisse Platzhalter
+        self.assertIn("#70707D", st["filaments"])
+        self.assertNotIn("#FFFFFF", st["filaments"])
+
+    def test_mehr_farben_als_filamente(self):
+        b = core.create()
+        n = MAX_FILAMENTE + 4
+        mats = [b.add_material(f"F{i}", [i * 12, 255 - i * 12, (i * 37) % 256]) for i in range(n)]
+        s = 10 / ZOLL
+        for i, mat in enumerate(mats):  # je Farbe ein Wuerfel, groessere Wuerfel fuer die ersten Farben
+            k = s * (1 + (n - i) / n)
+            o = (i * 3 * s, 0.0, 0.0)
+            p = [(o[0] + x * k, y * k, z * k) for x, y, z in
+                 [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]]
+            for q in [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]:
+                b.add_face([p[j] for j in q], material=mat)
+        core.save_atomic(b, self.tmp / "viele.skp")
+        hinweise = []
+        st, out = self.schreiben(self.tmp / "viele.skp", warn=hinweise.append)
+        self.assertEqual(st["colors"], n)
+        self.assertEqual(len(st["filaments"]), MAX_FILAMENTE)
+        self.assertEqual(st["colors_merged"], 4)
+        self.assertTrue(any("zusammengefasst" in h for h in hinweise), hinweise)
+        got = lies_farben(out)
+
+        def rgb(c):
+            return np.array([int(c[i:i + 2], 16) for i in (1, 3, 5)])
+        for tris in got["tris"].values():
+            for farbe, code in tris:
+                k = paint_zustand(code)
+                self.assertTrue(1 <= k <= MAX_FILAMENTE)
+                abstand = [int(((rgb(farbe) - rgb(f)) ** 2).sum()) for f in st["filaments"]]
+                self.assertEqual(abstand[k - 1], min(abstand))  # naechste behaltene Farbe
+        ini = prusa_ini(got["teile"]["Metadata/Slic3r_PE.config"].decode())
+        self.assertEqual(len(ini["filament_colour"].split(";")), MAX_FILAMENTE)
+
+
 # ---------------------------------------------------------------- Gegenproben mit echten Programmen
 # Laufen nur, wenn das Programm da ist. Pfade ueber Umgebungsvariablen:
 #   SKPTOOL_PRUSASLICER  prusa-slicer-console.exe (bzw. prusa-slicer)
@@ -597,6 +819,61 @@ class Test3mfEchteLeser(Base):
         self.assertEqual(code, 0, text)
         stl = next((self.tmp / "orca").rglob("*.stl"))
         self.assert_gleiche_geometrie(stl)
+
+
+class Test3mfFarbenEchteLeser(Base):
+    """Kommen die Farben in den Slicern an? Laufen nur, wenn der Slicer da ist."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = Path(tempfile.mkdtemp(prefix="skptool_3mf_farben_"))
+        skp = core.open_skp(farbmodell(cls.dir / "farben.skp"))
+        cls.out = cls.dir / "farben.3mf"
+        cls.st = write_3mf(core.model_of(skp), instanced_scene.build_instanced_scene(skp._parsed), cls.out,
+                           warn=lambda _t: None)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def run_prog(self, args):
+        p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=600, cwd=self.tmp)
+        return p.returncode, p.stdout + p.stderr
+
+    @unittest.skipUnless(PRUSA, "PrusaSlicer nicht gefunden (SKPTOOL_PRUSASLICER)")
+    def test_prusaslicer_druckt_jede_farbe_mit_eigenem_extruder(self):
+        """G-Code aus PrusaSlicer: die Filamentfarben stehen darin, und jede Farbe wird mit ihrem
+        Extruder gedruckt (Bemalung gelesen). Schwarz (unten) und Weiss (oben) nur in wenigen Schichten."""
+        gcode = self.tmp / "farben.gcode"
+        code, text = self.run_prog([PRUSA, "--datadir", str(self.tmp / "prusa-daten"), "--export-gcode",
+                                    str(self.out), "--output", str(gcode)])
+        self.assertEqual(code, 0, text)
+        g = gcode.read_text(encoding="utf-8", errors="replace")
+        ini = prusa_ini(g)
+        self.assertEqual(ini["extruder_colour"].split(";"), self.st["filaments"])
+        wechsel = re.findall(r"^T(\d+)\s*$", g, flags=re.M)
+        self.assertEqual(sorted(set(int(t) for t in wechsel)), list(range(len(self.st["filaments"]))))
+        seiten = [wechsel.count(str(i)) for i in range(len(self.st["filaments"]))]
+        schwarz, weiss = seiten[1], seiten[2]
+        self.assertLess(max(schwarz, weiss), min(seiten[3:]), seiten)  # Seiten gehen durch alle Schichten
+
+    @unittest.skipUnless(ORCA, "OrcaSlicer nicht gefunden (SKPTOOL_ORCASLICER)")
+    def test_orcaslicer_uebernimmt_farben_und_teile(self):
+        """OrcaSlicer liest Filamentfarben und das Filament je Teil: als Projekt neu gespeichert stehen
+        beide in seinen eigenen Dateien."""
+        (self.tmp / "orca").mkdir()
+        code, text = self.run_prog([ORCA, "--datadir", str(self.tmp / "orca-daten"), "--arrange", "0", "--orient", "0",
+                                    "--outputdir", str(self.tmp / "orca"), "--export-3mf", "neu.3mf", str(self.out)])
+        self.assertEqual(code, 0, text)
+        with zipfile.ZipFile(self.tmp / "orca" / "neu.3mf") as zf:
+            proj = json.loads(zf.read("Metadata/project_settings.config"))
+            ms = SafeET.fromstring(zf.read("Metadata/model_settings.config"))
+        self.assertEqual(proj["filament_colour"], self.st["filaments"])
+        teile = {p.find("metadata[@key='name']").get("value"): p.find("metadata[@key='extruder']").get("value")
+                 for p in ms.iter("part")}
+        self.assertEqual(teile.get("Klotz"), "1")  # orange, groesste Flaeche
+        self.assertEqual(sorted(teile.values()), ["1", "2"])  # Klotz zweimal, Wuerfel in seiner Hauptfarbe
 
 
 if __name__ == "__main__":

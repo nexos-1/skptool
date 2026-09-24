@@ -1,7 +1,8 @@
 """Import- und Export-Operatoren. Die eigentliche Arbeit macht skptool in einem eigenen Prozess.
 
 Ablauf Import:  skptool convert EIN.skp -o <temp>/model.blend  ->  Szene anhaengen, Collections und
-                Objekte in die aktuelle Szene uebernehmen.
+                Objekte in die aktuelle Szene uebernehmen (vorhandene Tags, gleiche Materialien und
+                gleiche Geometrie werden weiterbenutzt, siehe "Wiederholter Import").
 Ablauf Export:  Kopie der Datei speichern (save_as_mainfile copy=True, die offene Datei bleibt
                 unveraendert)  ->  bei "Selection Only" oder ohne Modifikatoren: eigener Blender im
                 Hintergrund filtert die Kopie (export_filter.py)  ->  skptool convert kopie.blend -o AUS.skp
@@ -10,11 +11,13 @@ Hintergrundmodus (blender -b) blockierend.
 """
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
 
 import bpy
+import numpy as np
 from bpy.props import BoolProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 from mathutils import Matrix
@@ -265,15 +268,249 @@ class IMPORT_SCENE_OT_skptool_skp(SkptoolTask, bpy.types.Operator, ImportHelper)
         if not os.path.isfile(self._blend):
             raise Failure("skptool did not write the intermediate .blend file")
         stats = append_scene(context, self._blend, _unit_scale(context, self.use_unit_scale))
+        reused = [f"{stats[k]} {what}" for k, what in (("reused_materials", "materials"),
+                                                        ("reused_meshes", "meshes")) if stats[k]]
         self.report({"INFO"}, f"Imported {self._src.name}: {stats['objects']} objects, "
-                              f"{stats['materials']} materials, tags: {', '.join(stats['collections']) or '-'}")
+                              f"{stats['materials']} materials, tags: {', '.join(stats['collections']) or '-'}"
+                              + (f" (reused existing {' and '.join(reused)})" if reused else ""))
         return {"FINISHED"}
+
+
+# ---------------------------------------------------------------- Wiederholter Import
+# Blender haengt ".001" an, wenn ein Name schon vergeben ist. Beim zweiten Import derselben (oder
+# einer verwandten) Datei entstuenden so "Layer0.001", "Walnut.001" und "Bein.001", die beim Export
+# eigene Tags, Materialien und Komponenten wuerden. Stattdessen: gleiche Tags nutzen die vorhandene
+# Collection, gleiche Materialien und gleiche Geometrie das vorhandene Datenobjekt (wie SketchUp,
+# das beim Import vorhandene Komponenten gleichen Namens weiterverwendet).
+
+_SUFFIX = re.compile(r"\.\d{3}$")
+SKP_TAG = "skp_tag"  # wie skptool/blender_scripts/bridge.py: Tag-Name an der Collection
+
+
+def _base(name):
+    return _SUFFIX.sub("", name)
+
+
+def _local(idb):
+    return idb is not None and idb.library is None and getattr(idb, "override_library", None) is None
+
+
+def _plain(value):
+    """Wert zum Vergleichen: Zahlenfolgen als gerundetes Tupel, ID-Properties als Python-Daten."""
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    if hasattr(value, "to_list"):
+        return value.to_list()
+    if isinstance(value, float):
+        return round(value, 6)
+    if isinstance(value, (set, frozenset)):  # Aufzaehlung mit Mehrfachauswahl
+        return tuple(sorted(value))
+    if isinstance(value, (str, int, bool)) or value is None or isinstance(value, bpy.types.ID):
+        return value
+    try:
+        return tuple(_plain(v) for v in value)
+    except TypeError:
+        return repr(value)
+
+
+def _same_props(a, b):
+    return {k: _plain(v) for k, v in a.items()} == {k: _plain(v) for k, v in b.items()}
+
+
+def _same_image(a, b):
+    if a == b:
+        return True
+    if a is None or b is None or a.source != b.source:
+        return False
+    pa, pb = a.packed_file, b.packed_file
+    if pa is not None and pb is not None:
+        return pa.size == pb.size and bytes(pa.data) == bytes(pb.data)
+    if pa is None and pb is None and a.filepath:
+        return (bpy.path.abspath(a.filepath, library=a.library)
+                == bpy.path.abspath(b.filepath, library=b.library))
+    return False
+
+
+def _same_value(a, b):
+    if isinstance(a, bpy.types.Image) or isinstance(b, bpy.types.Image):
+        return _same_image(a, b)
+    return _plain(a) == _plain(b)
+
+
+_NODE_BASE = None
+
+
+def _node_settings(node):
+    """Eigene Einstellungen eines Knotens (Operation, Bild, Interpolation ...), ohne Lage und Namen."""
+    global _NODE_BASE
+    if _NODE_BASE is None:
+        _NODE_BASE = {p.identifier for p in bpy.types.Node.bl_rna.properties}
+    out = {}
+    for p in node.bl_rna.properties:
+        if p.identifier in _NODE_BASE or p.identifier == "rna_type":
+            continue
+        if p.type not in {"BOOLEAN", "INT", "FLOAT", "STRING", "ENUM", "POINTER"}:
+            continue
+        try:
+            value = getattr(node, p.identifier)
+        except (AttributeError, TypeError):
+            continue
+        if p.type == "POINTER" and not (value is None or isinstance(value, bpy.types.ID)):
+            continue  # eingebettete Einstellungen (image_user, texture_mapping) nicht
+        out[p.identifier] = value
+    return out
+
+
+def _input_values(inputs):
+    return {s.identifier: getattr(s, "default_value", None) for s in inputs if not s.is_linked}
+
+
+def _same_dict(a, b):
+    return a.keys() == b.keys() and all(_same_value(a[k], b[k]) for k in a)
+
+
+def _same_node_tree(a, b):
+    if (a is None) != (b is None):
+        return False
+    if a is None:
+        return True
+    if {n.name for n in a.nodes} != {n.name for n in b.nodes}:
+        return False
+    for na in a.nodes:
+        nb = b.nodes[na.name]
+        if na.bl_idname != nb.bl_idname or not _same_dict(_node_settings(na), _node_settings(nb)):
+            return False
+        if not _same_dict(_input_values(na.inputs), _input_values(nb.inputs)):
+            return False
+        if getattr(na, "node_tree", None) is not None and na.node_tree != nb.node_tree:
+            return False  # Gruppenknoten: nur dieselbe Gruppe gilt als gleich
+
+    def links(t):
+        return {(l.from_node.name, l.from_socket.identifier, l.to_node.name, l.to_socket.identifier)
+                for l in t.links}
+    return links(a) == links(b)
+
+
+_MAT_SETTINGS = ("diffuse_color", "metallic", "roughness", "specular_intensity", "use_backface_culling",
+                 "blend_method", "surface_render_method", "alpha_threshold", "use_nodes", "pass_index")
+
+
+def same_material(a, b):
+    """Gleiches Aussehen: Einstellungen, Knoten samt Bildinhalt, eigene Eigenschaften (skp_*)."""
+    for attr in _MAT_SETTINGS:
+        if not _same_value(getattr(a, attr, None), getattr(b, attr, None)):
+            return False
+    return _same_props(a, b) and _same_node_tree(a.node_tree, b.node_tree)
+
+
+# Attribut-Datentyp -> (Feld, Werte je Element, numpy-Typ) fuer foreach_get
+_ATTR_ARRAYS = {"FLOAT": ("value", 1, "f4"), "INT": ("value", 1, "i4"), "INT8": ("value", 1, "i4"),
+                "BOOLEAN": ("value", 1, "?"), "FLOAT_VECTOR": ("vector", 3, "f4"),
+                "FLOAT2": ("vector", 2, "f4"), "INT32_2D": ("value", 2, "i4"),
+                "FLOAT_COLOR": ("color", 4, "f4"), "BYTE_COLOR": ("color", 4, "f4"),
+                "QUATERNION": ("value", 4, "f4"), "FLOAT4X4": ("value", 16, "f4")}
+
+
+def _array(collection, field, per, dtype):
+    arr = np.empty(len(collection) * per, dtype)
+    collection.foreach_get(field, arr)
+    return arr
+
+
+def _geometry_attributes(mesh):
+    """Attribute ohne Auswahl- und Ausblendzustand des Bearbeitungsmodus (".select_vert" usw.)."""
+    return {a.name: a for a in mesh.attributes if not a.name.startswith((".select", ".hide"))}
+
+
+def same_mesh(a, b):
+    """Gleiche Geometrie: Punkte, Kanten, Flaechen, alle Attribute (UV, harte Kanten, Rueckseiten),
+    dieselben Materialien und Eigenschaften. Im Zweifel (Formschluessel, unbekannte Attribute) nein."""
+    if a.shape_keys is not None or b.shape_keys is not None:
+        return False
+    for part in ("vertices", "edges", "loops", "polygons"):
+        if len(getattr(a, part)) != len(getattr(b, part)):
+            return False
+    if list(a.materials) != list(b.materials) or not _same_props(a, b):
+        return False
+    checks = [("vertices", "co", 3, "f4"), ("edges", "vertices", 2, "i4"),
+              ("loops", "vertex_index", 1, "i4"), ("polygons", "loop_start", 1, "i4"),
+              ("polygons", "loop_total", 1, "i4"), ("polygons", "material_index", 1, "i4")]
+    try:
+        for part, field, per, dtype in checks:
+            if not np.array_equal(_array(getattr(a, part), field, per, dtype),
+                                  _array(getattr(b, part), field, per, dtype)):
+                return False
+        names_a, names_b = _geometry_attributes(a), _geometry_attributes(b)
+        if names_a.keys() != names_b.keys():
+            return False
+        for name, at in names_a.items():
+            bt = names_b[name]
+            if at.domain != bt.domain or at.data_type != bt.data_type or len(at.data) != len(bt.data):
+                return False
+            spec = _ATTR_ARRAYS.get(at.data_type)
+            if spec is None:
+                return False
+            if not np.array_equal(_array(at.data, *spec), _array(bt.data, *spec)):
+                return False
+    except (RuntimeError, TypeError, ValueError):
+        return False
+    return (a.uv_layers.active_index == b.uv_layers.active_index
+            and [u.name for u in a.uv_layers] == [u.name for u in b.uv_layers])
+
+
+def _reuse(new_items, collection, same):
+    """Neue Datenobjekte "X.001", die dem vorhandenen "X" gleichen, durch dieses ersetzen."""
+    reused = 0
+    new = {item.as_pointer() for item in new_items}  # vor dem Loeschen, entfernte IDs nicht mehr anfassen
+    for item in new_items:
+        base = _base(item.name)
+        old = collection.get(base)
+        if base == item.name or not _local(old) or old.as_pointer() in new or not same(item, old):
+            continue
+        item.user_remap(old)
+        collection.remove(item)
+        reused += 1
+    return reused
+
+
+def _tag_name(col):
+    tag = col.get(SKP_TAG)
+    if isinstance(tag, str) and tag and tag in (col.name, _base(col.name)):
+        return tag
+    return _base(col.name)
+
+
+def _link_tags(target, cols):
+    """Tag-Collections der Zwischendatei in die Szene haengen. Gibt es in der Szene schon eine
+    Collection mit dem Tag-Namen, kommen die Objekte dorthin (ihre Sichtbarkeit bleibt)."""
+    in_scene = {c.name: c for c in target.collection.children_recursive}
+    names = []
+    for c in cols:
+        tag = _tag_name(c)
+        existing = in_scene.get(tag)
+        if existing is None or existing == c or not _local(existing):
+            target.collection.children.link(c)
+            names.append(c.name)
+            continue
+        for ob in list(c.objects):
+            if existing.objects.get(ob.name) is None:
+                existing.objects.link(ob)
+            c.objects.unlink(ob)
+        for ch in list(c.children):
+            if existing.children.get(ch.name) is None:
+                existing.children.link(ch)
+            c.children.unlink(ch)
+        bpy.data.collections.remove(c)
+        names.append(existing.name)
+    return names
 
 
 def append_scene(context, blend, unit_scale=None):
     """Szene aus der Zwischendatei anhaengen und ihren Inhalt in die aktuelle Szene haengen."""
     worlds_before = set(bpy.data.worlds)
     mats_before = set(bpy.data.materials)
+    meshes_before = set(bpy.data.meshes)
+    images_before = set(bpy.data.images)
     with bpy.data.libraries.load(blend, link=False) as (src, dst):
         if not src.scenes:
             raise Failure("The intermediate file contains no scene")
@@ -282,10 +519,16 @@ def append_scene(context, blend, unit_scale=None):
     if sc is None:
         raise Failure("Could not append the imported scene")
     target = context.scene
-    cols = list(sc.collection.children)
+    # erst Materialien (Meshes vergleichen ihre Materialliste), dann Geometrie, dann Bilder
+    reused_mats = _reuse([m for m in bpy.data.materials if m not in mats_before], bpy.data.materials,
+                         same_material)
+    reused_meshes = _reuse([m for m in bpy.data.meshes if m not in meshes_before], bpy.data.meshes,
+                           same_mesh)
+    for img in [i for i in bpy.data.images if i not in images_before]:
+        if img.users == 0:
+            bpy.data.images.remove(img)
     objects = list(sc.objects)
-    for c in cols:
-        target.collection.children.link(c)
+    tags = _link_tags(target, list(sc.collection.children))
     for ob in sc.collection.objects:
         target.collection.objects.link(ob)
     bpy.data.scenes.remove(sc)
@@ -310,7 +553,7 @@ def append_scene(context, blend, unit_scale=None):
         view.objects.active = first
     return {"objects": sum(1 for o in objects if o.type == "MESH"),
             "materials": len(set(bpy.data.materials) - mats_before),
-            "collections": [c.name for c in cols]}
+            "collections": tags, "reused_materials": reused_mats, "reused_meshes": reused_meshes}
 
 
 def _selection_tree(context):

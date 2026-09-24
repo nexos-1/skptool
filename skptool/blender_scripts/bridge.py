@@ -15,6 +15,7 @@ Ausgabe-Endungen: .blend .fbx .obj .stl .ply .usd .usda .usdc .usdz .abc .glb .g
 Umgebungsvariable SKPTOOL_TIMING=1 gibt Zeiten je Schritt auf stdout aus.
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -38,6 +39,7 @@ DEFAULT_MAT = "SketchUp_Standard"   # unbemalte Flaechen; beim Rueckweg wieder "
 DEFAULT_RGB = (0.86, 0.86, 0.84)
 DUMP_FORMAT = "skptool-dump-bin"
 _BLENDER_SUFFIX = re.compile(r"\.\d{3}$")
+SKP_TAG = "skp_tag"  # Collection-Eigenschaft: Name des SketchUp-Tags (gesetzt beim Import)
 DUMP_VERSION = 4  # 2: + harte Kanten + Rueckseitenmaterial, 3: + Rueckseiten-UV,
                   # 4: + Hierarchie (parent, Matrix relativ zum Elternobjekt, Leerobjekte)
 MESHY = {"MESH", "CURVE", "SURFACE", "META", "FONT"}
@@ -471,11 +473,13 @@ def fix_up_skp_import(meta, keep_triangles=False):
                     if mat.get("skp_colorize_type") is not None and _colorize_nodes(mat))
     _lap("materials")
 
-    # Ebenen (Tags) als Collections
+    # Ebenen (Tags) als Collections. SKP_TAG haelt den Tag-Namen fest, auch wenn Blender der
+    # Collection spaeter ".001" anhaengt (Import in eine Szene, die den Namen schon hat).
     layer_cols = {}
     root = bpy.context.scene.collection
     for layer in meta["layers"]:
         col = bpy.data.collections.new(layer["name"])
+        col[SKP_TAG] = layer["name"]
         root.children.link(col)
         layer_cols[layer["name"]] = (col, layer.get("hidden", False))
 
@@ -635,6 +639,7 @@ class _MaterialTable:
     def __init__(self, images_dir):
         self.images_dir = images_dir
         self.mats, self.index, self.by_look = [], {}, {}
+        self.exact = []  # je Eintrag: ein Material traegt den Grundnamen ohne ".001"
 
     def id(self, mat):
         if _is_default(mat):
@@ -642,12 +647,13 @@ class _MaterialTable:
         if mat.name in self.index:
             return self.index[mat.name]
         # Blender haengt bei Namensgleichheit ".001" an. Gleicher Grundname und gleiches Aussehen
-        # = dasselbe SketchUp-Material; sonst behaelt der Writer beide unter eigenem Namen.
+        # = dasselbe SketchUp-Material; sonst behaelt jedes seinen eigenen Namen (finish_names).
         base = _BLENDER_SUFFIX.sub("", mat.name)
         look = (base, tuple(_mat_rgb(mat) or ()), round(float(mat.diffuse_color[3]), 3),
-                _mat_image(mat).name.split(".")[0] if _mat_image(mat) else None)
+                _BLENDER_SUFFIX.sub("", _mat_image(mat).name) if _mat_image(mat) else None)
         if look in self.by_look:
             self.index[mat.name] = self.by_look[look]
+            self.exact[self.index[mat.name]] |= mat.name == base
             return self.index[mat.name]
         mats = self.mats
         rgb = _mat_rgb(mat)
@@ -703,7 +709,21 @@ class _MaterialTable:
             except (TypeError, ValueError):
                 pass
         mats.append(entry)
+        self.exact.append(mat.name == base)
         return self.index[mat.name]
+
+    def finish_names(self):
+        """Eindeutige Namen wie im Writer ("Holz", "Holz_2"). Den Grundnamen bekommt das Material,
+        das ihn in Blender ohne ".001" traegt, unabhaengig davon, welches zuerst benutzt wurde."""
+        used = set()
+        for i in sorted(range(len(self.mats)), key=lambda i: (not self.exact[i], i)):
+            base = name = self.mats[i]["name"]
+            n = 1
+            while name in used:
+                n += 1
+                name = f"{base}_{n}"
+            used.add(name)
+            self.mats[i]["name"] = name
 
 
 def _mesh_arrays(me):
@@ -812,11 +832,47 @@ def _hidden_layers():
 _UNTAGGED = ("", "Layer0", "Untagged", "Scene Collection")  # werden kein eigenes Tag
 
 
-def _instance_entry(ob, d, inst_mat, scene_col, flatten):
-    layer = next((c.name for c in ob.users_collection if c != scene_col), "")
-    # Liegt das Objekt in einer ausgeblendeten Collection, die kein Tag wird, bleibt es eben
-    # selbst verborgen, damit es in SketchUp nicht ploetzlich erscheint
-    hidden = _own_hidden(ob) or (layer in _UNTAGGED and not ob.visible_get())
+def _tag_of_collection(col, collections):
+    """Name des SketchUp-Tags einer Collection.
+
+    Blender haengt ".001" an, wenn der Name schon vergeben ist (z. B. zweiter Import in dieselbe
+    Szene). Solche Collections gehoeren zum Tag ohne Endung: die beim Import gemerkte Eigenschaft
+    SKP_TAG gilt, solange der Name noch zu ihr passt (nicht umbenannt); sonst wird "X.001" zu "X",
+    wenn es eine Collection "X" gibt. Ein Tag, der in SketchUp selbst "X.001" heisst, bleibt so."""
+    tag = col.get(SKP_TAG)
+    base = _BLENDER_SUFFIX.sub("", col.name)
+    if isinstance(tag, str) and tag and tag in (col.name, base):
+        return tag
+    if base != col.name and collections.get(base) is not None:
+        return base
+    return col.name
+
+
+class _Tags:
+    """Collections -> Tags: Namen ohne Blenders ".001" und Sichtbarkeit je Tag. Ein Tag ist nur
+    verborgen, wenn alle seine Collections ausgeblendet sind; Objekte aus einer ausgeblendeten
+    Collection eines sichtbaren Tags werden selbst verborgen geschrieben."""
+
+    def __init__(self):
+        cols = bpy.data.collections
+        self.of = {c.name: _tag_of_collection(c, cols) for c in cols}
+        self.hidden_cols = set(_hidden_layers())
+        sources = {}
+        for col, tag in self.of.items():
+            sources.setdefault(tag, []).append(col)
+        self.names = list(sources)
+        self.hidden = sorted(t for t, cs in sources.items() if all(c in self.hidden_cols for c in cs))
+
+    def hidden_alone(self, col):
+        return col in self.hidden_cols and self.of.get(col, col) not in self.hidden
+
+
+def _instance_entry(ob, d, inst_mat, scene_col, flatten, tags):
+    col = next((c.name for c in ob.users_collection if c != scene_col), "")
+    layer = tags.of.get(col, col)
+    # Liegt das Objekt in einer ausgeblendeten Collection, die kein Tag wird (oder deren Tag
+    # sichtbar bleibt), bleibt es eben selbst verborgen, damit es in SketchUp nicht ploetzlich erscheint
+    hidden = _own_hidden(ob) or (layer in _UNTAGGED and not ob.visible_get()) or tags.hidden_alone(col)
     return {"name": ob.name, "definition": d, "parent": -1,
             "matrix": None if flatten else ob,  # _link_parents setzt die Matrix
             "layer": layer, "hidden": hidden, "material": inst_mat,
@@ -874,7 +930,8 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
                       zum Elternobjekt (ohne Eltern: Welt), "layer", "hidden" (das Objekt
                       selbst, nicht seine Ebene), "material": Materialindex oder -1,
                       "skp_definition": Name oder ""}],
-       "layers": [Namen], "hidden_layers": [Namen der ausgeblendeten Ebenen]}
+       "layers": [Tag-Namen der Collections, "X.001" als "X", siehe _Tags],
+       "hidden_layers": [Namen der ausgeblendeten Ebenen]}
     Binaerdatei, je Definition ab "offset" hintereinander (little endian):
       verts   float32[nverts*3]  lokale Koordinaten (bei flatten: Weltkoordinaten)
       ltotal  int32[npolys]      Eckenzahl je Flaeche
@@ -882,7 +939,8 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
       pmat    int32[npolys]      Materialindex je Flaeche, -1 = Standard
       uv      float32[nuv*2]     UV nur fuer Ecken von Flaechen mit Texturmaterial (in Flaechen-
                                  reihenfolge); nuv = 0, wenn das Mesh keine UV-Ebene hat
-    Eine Definition = ein geteiltes Mesh mit einer bestimmten effektiven Materialbelegung.
+    Eine Definition = ein geteiltes Mesh mit einer bestimmten effektiven Materialbelegung; Kopien
+    mit Blenders Endung ("Brett.001") und bitgleichem Inhalt teilen die Definition des Originals.
     Objekte, die nur Standard-Slots einheitlich per Objekt-Material ueberschreiben (geerbte
     Bemalung), teilen die Definition und tragen das Material an der Instanz.
     Objekte mit Modifikatoren, Formschluesseln oder Nicht-Mesh-Typen werden ausgewertet und
@@ -890,9 +948,11 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
     """
     os.makedirs(images_dir, exist_ok=True)
     mt = _MaterialTable(images_dir)
+    tags = _Tags()
     scene_col = bpy.context.scene.collection
     depsgraph = None
     defs, def_index, instances = [], {}, []
+    by_content = {}  # Grundname + Inhalt -> Definition (Kopien "X.001" mit gleichem Inhalt)
     total_faces = placed_faces = 0
     included = {}  # Objektname -> Index in instances
     with open(bin_path, "wb") as fh:
@@ -902,7 +962,7 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
                 continue  # Scher-Huellen sind durchlaessig: ihr Kind traegt die volle Matrix
             if ob.type == "EMPTY":
                 included[ob.name] = len(instances)
-                instances.append(_instance_entry(ob, -1, -1, scene_col, flatten))
+                instances.append(_instance_entry(ob, -1, -1, scene_col, flatten, tags))
                 continue
             t = time.perf_counter()
             evaluated = (flatten or ob.type != "MESH" or len(ob.modifiers) > 0
@@ -925,7 +985,7 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
                     ev.to_mesh_clear()
                 if not flatten:  # kann noch Kinder tragen
                     included[ob.name] = len(instances)
-                    instances.append(_instance_entry(ob, -1, -1, scene_col, flatten))
+                    instances.append(_instance_entry(ob, -1, -1, scene_col, flatten, tags))
                 continue
             slots = ob.material_slots
             eff = [mt.id(s.material) for s in slots] or [-1]
@@ -974,19 +1034,32 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
                     all_b = np.empty(len(me.loops) * 2, np.float32)
                     src_layer.data.foreach_get("uv", all_b)
                     buv = all_b.reshape(-1, 2)[np.repeat(back_tex, lt)]
-                entry = {"name": me.name if not evaluated else ob.name, "offset": fh.tell(),
-                         "nverts": len(co), "npolys": len(lt), "nloops": len(lv), "nuv": len(uv),
-                         "nhard": len(hard), "nbuv": len(buv), "uses": 0}
-                for arr in (co, lt, lv, pmat, uv, hard, pback, buv):
-                    fh.write(np.ascontiguousarray(arr).tobytes())
-                d = def_index[key] = len(defs)
-                defs.append(entry)
-                total_faces += len(lt)
+                name = me.name if not evaluated else ob.name
+                arrays = [np.ascontiguousarray(arr) for arr in (co, lt, lv, pmat, uv, hard, pback, buv)]
+                # Kopie mit Blenders Endung ("Bein.001" neben "Bein", etwa nach Umschalt+D oder
+                # zweitem Import) und gleichem Inhalt: dieselbe Definition wie das Original
+                digest = hashlib.sha256()
+                for arr in arrays:
+                    digest.update(repr((arr.dtype.str, arr.shape)).encode())
+                    digest.update(arr.tobytes())
+                content = (_BLENDER_SUFFIX.sub("", name), digest.digest())
+                d = by_content.get(content)
+                if d is None:
+                    entry = {"name": name, "offset": fh.tell(),
+                             "nverts": len(co), "npolys": len(lt), "nloops": len(lv), "nuv": len(uv),
+                             "nhard": len(hard), "nbuv": len(buv), "uses": 0}
+                    for arr in arrays:
+                        fh.write(arr.tobytes())
+                    d = by_content[content] = len(defs)
+                    defs.append(entry)
+                    total_faces += len(lt)
+                def_index[key] = d
+                del arrays
             t = _acc("arrays+write", t)
             defs[d]["uses"] += 1
             placed_faces += defs[d]["npolys"]
             included[ob.name] = len(instances)
-            instances.append(_instance_entry(ob, d, inst_mat, scene_col, flatten))
+            instances.append(_instance_entry(ob, d, inst_mat, scene_col, flatten, tags))
             if ev is not None:
                 ev.to_mesh_clear()
             _acc("instance bookkeeping", t)
@@ -1000,11 +1073,11 @@ def dump_meshes_bin(header_path, bin_path, images_dir, flatten=False):
     for mat in bpy.data.materials:
         if mat.get("skp_unused") and mat.use_fake_user:
             mt.id(mat)
+    mt.finish_names()
     header = {"format": DUMP_FORMAT, "version": DUMP_VERSION, "unit": "m",
               "bin": os.path.basename(bin_path), "materials": mt.mats,
               "definitions": defs, "instances": instances,
-              "layers": [c.name for c in bpy.data.collections],
-              "hidden_layers": _hidden_layers()}
+              "layers": tags.names, "hidden_layers": tags.hidden}
     with open(header_path, "w", encoding="utf-8") as fh:
         json.dump(header, fh)
     _flush_acc()

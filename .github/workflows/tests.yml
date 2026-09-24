@@ -79,7 +79,8 @@ jobs:
         run: '"$RUNNER_TEMP/paket/bin/python" -m unittest tests.test_paket -v'
 
   blender-linux:
-    # Dieselbe Blender-Version wie lokal (5.2.0 LTS), per SHA-256 geprueft. Fenster-Tests bleiben aus.
+    # Dieselbe Blender-Version wie lokal (5.2.0 LTS), per SHA-256 geprueft. Fenster-Tests bleiben hier
+    # aus, sie laufen im Job blender-linux-live auf einem virtuellen Bildschirm.
     name: Mit Blender 5.2.0 auf Linux
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -113,3 +114,47 @@ jobs:
         run: |
           "$SKPTOOL_BLENDER" --version
           python -m unittest discover -s tests -v
+
+  blender-linux-live:
+    # Fenster-Tests des Live-Modus unter Linux: echtes Blender-Fenster auf einem virtuellen Bildschirm
+    # (xvfb-run, Standard 1280x1024 mit 24 Bit), OpenGL als Software-Rendering aus Mesa (llvmpipe).
+    # Blender wie im Job darueber, per SHA-256 geprueft.
+    name: Live-Modus mit Blender unter Linux (Xvfb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      BLENDER_URL: https://download.blender.org/release/Blender5.2/blender-5.2.0-linux-x64.tar.xz
+      BLENDER_SHA256: 96f6c181a30f4950607839dc84d42a354b250d8a0231b098b59b7bc69c351c48
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Systembibliotheken fuer Blender und virtueller Bildschirm
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libegl1 libgl1 libgl1-mesa-dri libegl-mesa0 libxi6 libxkbcommon0 libxxf86vm1 libxfixes3 libxrender1 libsm6 xvfb xauth
+      - name: Blender laden und pruefen
+        run: |
+          curl -fsSL -o blender.tar.xz "$BLENDER_URL"
+          echo "$BLENDER_SHA256  blender.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/blender"
+          tar -xf blender.tar.xz -C "$RUNNER_TEMP/blender" --strip-components=1
+          rm blender.tar.xz
+          echo "SKPTOOL_BLENDER=$RUNNER_TEMP/blender/blender" >> "$GITHUB_ENV"
+      - name: Abhaengigkeiten (nur mit Pruefsummen)
+        run: python -m pip install --require-hashes --no-deps -r requirements.lock
+      - name: Live-Tests mit Blender-Fenster
+        # Gruen allein reicht nicht: uebersprungene Fenster-Tests waeren auch gruen.
+        # shell: bash ausdruecklich, denn nur dann laeuft sie mit pipefail (sonst verschluckte tee den Fehler).
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          "$SKPTOOL_BLENDER" --version
+          xvfb-run -a python -m unittest tests.test_live -v 2>&1 | tee "$RUNNER_TEMP/live.log"
+          if ! grep -q "Live-Blender bereit nach" "$RUNNER_TEMP/live.log"; then
+            echo "Die Fenster-Tests sind nicht gelaufen (uebersprungen?)"
+            exit 1
+          fi

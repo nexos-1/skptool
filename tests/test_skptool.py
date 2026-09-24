@@ -474,8 +474,96 @@ bpy.ops.wm.save_as_mainfile(filepath=sys.argv[-2])
 """
 
 
+# Blender haengt bei doppelten Namen ".001" an (zweiter Import, Umschalt+D, neue Collection mit
+# vergebenem Namen). Beim Schreiben der .skp sollen daraus keine eigenen Tags, Materialien und
+# Komponenten werden, solange es dasselbe ist.
+DOPPELTE_NAMEN_SCENE = """
+import bpy, sys
+bpy.ops.wm.read_factory_settings(use_empty=True)
+sc = bpy.context.scene
+
+def col(name, tag=None, hidden=False):
+    c = bpy.data.collections.new(name)
+    sc.collection.children.link(c)
+    if tag:
+        c["skp_tag"] = tag
+    c.hide_viewport = hidden
+    return c
+
+def mat(name, rgb):
+    m = bpy.data.materials.new(name)
+    m.use_nodes = True
+    m.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (*rgb, 1)
+    m.diffuse_color = (*rgb, 1)
+    return m
+
+def box(name, size, material=None):
+    me = bpy.data.meshes.new(name)
+    v = [(x, y, z) for x in (0, size[0]) for y in (0, size[1]) for z in (0, size[2])]
+    me.from_pydata(v, [], [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)])
+    if material:
+        me.materials.append(material)
+    return me
+
+def place(name, me, c, x):
+    ob = bpy.data.objects.new(name, me)
+    c.objects.link(ob)
+    ob.location = (x, 0, 0)
+
+lack, lack_blau = mat("Lack", (1, 0, 0)), mat("Lack", (0, 0, 1))  # "Lack.001" sieht anders aus
+holz, holz_kopie = mat("Holz", (0.5, 0.25, 0.0)), mat("Holz", (0.5, 0.25, 0.0))  # gleich
+l0, l0b = col("Layer0"), col("Layer0")
+h, hb = col("Holz"), col("Holz", hidden=True)
+a, ab = col("Aus", hidden=True), col("Aus", hidden=True)
+st, st1 = col("Stage"), col("Stage.001", tag="Stage.001")  # in SketchUp wirklich "Stage.001"
+ez = col("Einzeln.001")
+stuhl = col("Stuhl", tag="Chair")  # nach dem Import umbenannt
+names = [m.name for m in (lack_blau, holz_kopie)] + [c.name for c in (l0b, hb, ab, st1)]
+assert names == ["Lack.001", "Holz.001", "Layer0.001", "Holz.001", "Aus.001", "Stage.001"], names
+# zuerst benutzt wird "Lack.001": trotzdem bekommt "Lack" den Namen ohne Endung
+place("Platte", box("Platte", (1, 1, 0.1), lack_blau), l0, 0)
+place("Latte", box("Latte", (1, 0.1, 0.1), lack), l0b, 1.5)
+brett = box("Brett", (0.2, 0.5, 0.02), holz)
+place("Brett_sichtbar", brett, h, 3)
+place("Brett_versteckt", brett.copy(), hb, 4)                        # "Brett.001", gleicher Inhalt
+place("Brett_anders", box("Brett", (0.3, 0.5, 0.02), holz_kopie), h, 5)  # "Brett.002", anders
+place("Kiste_aus", box("Kiste_aus", (0.1, 0.1, 0.1)), a, 6)
+place("Kiste_aus2", box("Kiste_aus2", (0.2, 0.1, 0.1)), ab, 7)
+place("Kiste_stage", box("Kiste_stage", (0.3, 0.1, 0.1)), st, 8)
+place("Kiste_stage1", box("Kiste_stage1", (0.4, 0.1, 0.1)), st1, 9)
+place("Kiste_einzeln", box("Kiste_einzeln", (0.5, 0.1, 0.1)), ez, 10)
+place("Kiste_stuhl", box("Kiste_stuhl", (0.6, 0.1, 0.1)), stuhl, 11)
+bpy.ops.wm.save_as_mainfile(filepath=sys.argv[-1])
+"""
+
+
 @unittest.skipUnless(HAVE_BLENDER, "Blender nicht installiert")
 class TestBlender(Base):
+    def test_blender_namensendungen_werden_zusammengefuehrt(self):
+        src = self.tmp / "doppelt.blend"
+        run_blender_script(DOPPELTE_NAMEN_SCENE, self.tmp, src)
+        skp = self.tmp / "doppelt.skp"
+        code, text = run_cli("convert", str(src), "-o", str(skp))
+        self.assertEqual(code, 0, text)
+        m = core.model_of(core.open_skp(skp))
+        layers = {l.name: bool(l.hidden) for l in m.layers}
+        self.assertEqual(layers, {"Layer0": False, "Holz": False, "Aus": True, "Stage": False,
+                                  "Stage.001": False, "Einzeln.001": False, "Stuhl": False})
+        inst = {i.name: i for i in m.root.instances}
+        tag = {n: (i.layer if i.layer not in (None, "") else "Layer0") for n, i in inst.items()}
+        self.assertEqual(tag, {"Platte": "Layer0", "Latte": "Layer0", "Brett_sichtbar": "Holz",
+                               "Brett_versteckt": "Holz", "Brett_anders": "Holz", "Kiste_aus": "Aus",
+                               "Kiste_aus2": "Aus", "Kiste_stage": "Stage", "Kiste_stage1": "Stage.001",
+                               "Kiste_einzeln": "Einzeln.001", "Kiste_stuhl": "Stuhl"})
+        # sichtbarer Tag Holz: nur das Objekt aus der ausgeblendeten "Holz.001" ist selbst verborgen
+        self.assertEqual(sorted(n for n, i in inst.items() if i.hidden), ["Brett_versteckt"])
+        colors = {mt.name: list(mt.color)[:3] for mt in m.materials}
+        self.assertEqual(colors, {"Lack": [255, 0, 0], "Lack_2": [0, 0, 255], "Holz": [128, 64, 0]})
+        # "Brett.001" mit gleichem Inhalt ist dieselbe Komponente, "Brett.002" eine eigene Definition
+        self.assertEqual(inst["Brett_sichtbar"].ref_idx, inst["Brett_versteckt"].ref_idx)
+        self.assertNotEqual(inst["Brett_sichtbar"].ref_idx, inst["Brett_anders"].ref_idx)
+        self.assertEqual(m.definitions[inst["Brett_sichtbar"].ref_idx].name, "Brett")
+
     def test_external_files_are_dropped_unless_allowed(self):
         import contextlib
         outside = self.tmp / "anderswo"

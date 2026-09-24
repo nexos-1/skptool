@@ -1,24 +1,32 @@
 #!/bin/sh
-# Linux-Pruefung mit echten Dateien in Docker (Python 3.12, Blender 5.2.0, ohne Bildschirm).
+# Linux-Pruefung mit echten Dateien in Docker (Python 3.12, Blender 5.2.0, virtueller Bildschirm Xvfb).
 #
 # Aufruf aus dem Projektordner (Linux, macOS oder Git Bash unter Windows, Docker muss laufen):
-#   sh tools/linux_e2e.sh [AUSGABEORDNER]
+#   sh tools/linux_e2e.sh [AUSGABEORDNER]             alles (Schritte 1 bis 6)
+#   sh tools/linux_e2e.sh --nur-live [AUSGABEORDNER]  nur Schritte 1 und 3 (Live-Modus mit Fenster)
 # Vorher fuer alle Tests die externen Beispiele laden: python tools/beispiele_laden.py
 #
 # Das Projekt wird nur lesend eingehaengt (/src), Ergebnisse landen im Ausgabeordner (/out, Standard: ein
 # neuer temporaerer Ordner). Im Container, ohne root:
 #   1. Abhaengigkeiten nur aus requirements.lock mit --require-hashes in eine eigene venv
 #   2. ganze Testsuite mit Blender (ohne Fenster-Tests)
-#   3. Paket bauen (setuptools mit Pruefsumme aus tools/paketbau.lock) und in eine frische venv installieren
-#   4. mit dem installierten Befehl skptool aus einem Ordner voller praeparierter Python-Dateien:
+#   3. Fenster-Tests des Live-Modus (tests.test_live, dazu die live_*-Werkzeuge in tests.test_mcp) mit
+#      echtem Blender-Fenster auf einem virtuellen Bildschirm (xvfb-run, OpenGL per Software aus Mesa)
+#   4. Paket bauen (setuptools mit Pruefsumme aus tools/paketbau.lock) und in eine frische venv installieren
+#   5. mit dem installierten Befehl skptool aus einem Ordner voller praeparierter Python-Dateien:
 #      convert --jobs auto nach .glb und .blend, Rueckweg nach .skp, diff, report, mcp
-#   5. Speicherwaechter mit Speichergrenze des Containers (docker --memory)
+#   6. Speicherwaechter mit Speichergrenze des Containers (docker --memory)
 # Rueckgabewert 0 nur, wenn alles gruen ist.
 set -eu
 
 if [ "${1:-}" != "--im-container" ]; then
     # ---------------------------------------------------------------- auf dem Rechner
     export MSYS_NO_PATHCONV=1  # Git Bash: Pfade wie /src nicht in Windows-Pfade umschreiben
+    MODUS=alles
+    if [ "${1:-}" = "--nur-live" ]; then
+        MODUS=live
+        shift
+    fi
     cd "$(dirname "$0")/.."
     REPO=$(pwd -W 2>/dev/null || pwd)
     OUT=${1:-$(mktemp -d)}
@@ -29,14 +37,16 @@ if [ "${1:-}" != "--im-container" ]; then
     docker build -q -t "$BILD" - < tools/linux_e2e.Dockerfile
     echo "Ausgabe: $OUT"
     # --init holt beendete Kindprozesse ab (sonst bleiben im Container Zombies stehen);
-    # --memory setzt eine Speichergrenze, die der Speicherwaechter erkennen muss
-    exec docker run --rm --init --memory=6g \
+    # --memory setzt eine Speichergrenze, die der Speicherwaechter erkennen muss;
+    # eigener Name je Lauf, damit nie ein fremder Container gemeint ist
+    exec docker run --rm --init --memory=6g --name "skptool-linux-e2e-$$" \
         --mount "type=bind,src=$REPO,dst=/src,readonly" \
         --mount "type=bind,src=$OUT,dst=/out" \
-        "$BILD" sh /src/tools/linux_e2e.sh --im-container
+        "$BILD" sh /src/tools/linux_e2e.sh --im-container "$MODUS"
 fi
 
 # ---------------------------------------------------------------- im Container
+MODUS=${2:-alles}
 SRC=/src
 OUT=/out
 ARBEIT=$(mktemp -d)
@@ -55,12 +65,40 @@ PY="$ARBEIT/venv/bin/python"
 "$PY" -m pip install -q --require-hashes --no-deps -r "$SRC/requirements.lock"
 "$PY" -m pip list --format=freeze
 
-schritt "Testsuite mit Blender (Projektordner nur lesend)"
-if (cd "$SRC" && "$PY" -m unittest discover -s tests) > "$OUT/tests.log" 2>&1; then
-    tail -4 "$OUT/tests.log"
+if [ "$MODUS" = alles ]; then
+    schritt "Testsuite mit Blender (Projektordner nur lesend)"
+    if (cd "$SRC" && "$PY" -m unittest discover -s tests) > "$OUT/tests.log" 2>&1; then
+        tail -4 "$OUT/tests.log"
+    else
+        tail -40 "$OUT/tests.log"
+        fehler "Testsuite"
+    fi
+fi
+
+schritt "Live-Modus mit Blender-Fenster auf virtuellem Bildschirm (Xvfb)"
+# xvfb-run -a sucht eine freie Anzeige und startet Xvfb (Standard: 1280x1024, 24 Bit), beendet ihn danach.
+# env -u schaltet die Fenster-Tests ein, die das Image sonst abschaltet.
+if (cd "$SRC" && timeout 1800 xvfb-run -a env -u SKPTOOL_SKIP_GUI_TESTS \
+        "$PY" -m unittest tests.test_live tests.test_mcp -v) > "$OUT/live.log" 2>&1; then
+    grep -E "^  (Live-Blender|ops-Latenz|Bild model|Speichern|quit)" "$OUT/live.log" || true
+    tail -4 "$OUT/live.log"
 else
-    tail -40 "$OUT/tests.log"
-    fehler "Testsuite"
+    tail -60 "$OUT/live.log"
+    fehler "Live-Modus mit Fenster"
+fi
+# Gruen allein reicht nicht: uebersprungene Fenster-Tests waeren auch gruen
+if ! grep -q "Live-Blender bereit nach" "$OUT/live.log" || grep -q "GUI-Tests abgeschaltet" "$OUT/live.log"; then
+    fehler "Fenster-Tests sind nicht gelaufen (uebersprungen?)"
+fi
+
+if [ "$MODUS" = live ]; then
+    schritt "Ergebnis"
+    if [ "$FEHLER" -ne 0 ]; then
+        echo "ROT: $FEHLER Fehler"
+        exit 1
+    fi
+    echo "GRUEN"
+    exit 0
 fi
 
 schritt "Paket bauen und installieren"

@@ -127,6 +127,7 @@ class Live:
         self.slots = threading.BoundedSemaphore(MAX_HANDLERS)
         self.tmp = tempfile.mkdtemp(prefix="skptool_live_")
         self.shots = 0
+        self.redraws = 0
         self.last_activity = 0.0
         self.ready = False
         self.stopping = False
@@ -304,7 +305,10 @@ class Live:
         job.response = resp
         job.state = "fertig"
         job.done.set()
-        _redraw()
+        # Kein _redraw() nach jedem Auftrag: das Neuzeichnen laeuft im selben Durchlauf der
+        # Hauptschleife und haelt die naechste Anfrage auf (mit Software-OpenGL, z. B. Linux unter
+        # Xvfb, gemessen 55 bis 70 ms je Auftrag, auch fuer ping). Befehle, die etwas Sichtbares
+        # aendern (ops mit Aenderung, undo, save, Export), zeichnen selbst neu.
 
     # ------------------------------------------------------------ Statusdatei
 
@@ -463,6 +467,8 @@ def _override(need_view3d=False):
 
 
 def _redraw():
+    if LIVE is not None:
+        LIVE.redraws += 1  # fuer status: zeigt, dass nur lesende Befehle nicht neu zeichnen lassen
     try:
         for win in bpy.context.window_manager.windows:
             for area in win.screen.areas:
@@ -535,7 +541,8 @@ def cmd_status(live, req):
     return {"blend": bpy.data.filepath, "dirty": bpy.data.is_dirty, "mode": bpy.context.mode,
             "objects": meshes, "all_objects": len(scene.objects), "engine": scene.render.engine,
             "camera": scene.camera.name if scene.camera else None, "blender": bpy.app.version_string, "pid": os.getpid(), "port": live.port,
-            "export": live.export_status(), "queue": live.jobs.qsize(), "ops": sorted(skp_ops.OPS)}
+            "export": live.export_status(), "queue": live.jobs.qsize(), "ops": sorted(skp_ops.OPS),
+            "redraws": live.redraws}
 
 
 def _ensure_object_mode():
@@ -562,7 +569,8 @@ def cmd_ops(live, req):
             names = list(dict.fromkeys(changing))
             undo = ("skptool: " + ", ".join(names))[:60]
             bpy.ops.ed.undo_push(message=undo)
-    _redraw()
+    if changing or switched:  # nur lesende Operationen (list, measure, ...) aendern nichts Sichtbares
+        _redraw()
     out = {"ok": all(r.get("ok") for r in results), "results": results, "undo_step": undo}
     if switched:
         out["note"] = "Blender war nicht im Objektmodus, auf Objektmodus umgeschaltet"
@@ -593,6 +601,7 @@ def cmd_save(live, req):
     with bpy.context.temp_override(**_override()):
         bpy.ops.wm.save_mainfile()
     # save_post hat den Export bereits eingeplant (falls ein Ziel gesetzt ist)
+    _redraw()  # Titel und Statusleiste zeigen den gespeicherten Stand
     return {"saved": bpy.data.filepath, "export": live.export_status()}
 
 

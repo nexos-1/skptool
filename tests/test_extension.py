@@ -196,11 +196,13 @@ class ManifestTest(unittest.TestCase):
 
     def test_keine_shell_kein_code_aus_dateien(self):
         verboten = ["shell=" + "True", "os." + "system", "os." + "popen", "ev" + "al(", "ex" + "ec(",
-                    "urllib", "socket", "http.client", "requests"]
+                    "urllib", "http.client", "requests"]
         for py in EXT.glob("*.py"):
             src = py.read_text(encoding="utf-8")
             for bad in verboten:
                 self.assertNotIn(bad, src, f"{py.name}: {bad}")
+            # das Modul socket; Blenders Knoten-API (link.from_socket) ist erlaubt
+            self.assertIsNone(re.search(r"(?<![\w.])socket\b", src), f"{py.name}: socket")
 
     def test_kein_openskp_in_der_erweiterung(self):
         for p in EXT.rglob("*"):
@@ -208,6 +210,34 @@ class ManifestTest(unittest.TestCase):
             if p.suffix == ".py":
                 self.assertIsNone(re.search(r"^\s*(import|from)\s+(openskp|skptool)\b",
                                             p.read_text(encoding="utf-8"), re.M), p.name)
+
+
+TAG_OPS = [{"op": "set_layer", "select": {"name": "Leg_Chair*"}, "layer": "Chair"},
+           {"op": "set_layer", "select": {"name": "Leg_Table*"}, "layer": "Table"},
+           {"op": "set_layer", "select": {"name": "Tabletop"}, "layer": "Table"}]
+SUFFIX = re.compile(r"\.\d{3}$")  # Blenders Endung bei doppelten Namen
+
+
+def skp_summary(path: Path) -> dict:
+    """Tags, Materialien (Name -> RGB), Definitionen und die Platzierungen im ausgeklappten Modell
+    je (Definition ohne "#2", Tag), direkt mit OpenSKP gelesen."""
+    from skptool import core
+    m = core.model_of(core.open_skp(path))
+    placed = {}
+    faces = [len(m.root.faces)]
+
+    def walk(d):
+        for inst in d.instances:
+            ref = m.definitions[inst.ref_idx]
+            key = (re.sub(r"#\d+$", "", ref.name), inst.layer if inst.layer not in (None, "", "Layer0") else "")
+            placed[key] = placed.get(key, 0) + 1
+            faces[0] += len(ref.faces)
+            walk(ref)
+    walk(m.root)
+    return {"layers": [l.name for l in m.layers],
+            "materials": {mt.name: list(mt.color)[:3] for mt in m.materials},
+            "definitions": [d.name for d in m.definitions.values() if not d.is_image],
+            "placed": placed, "faces_placed": faces[0]}
 
 
 def real_config_dir() -> Path:
@@ -258,9 +288,14 @@ class ExtensionBlenderTest(unittest.TestCase):
         cls.project = cls._make_project()
         cls.out = cls.tmp / "out"
         cls.out.mkdir()
+        # Stuhl mit Objekten auf den Tags Chair und Table (im Original liegt alles auf Layer0)
+        cls.stuhl_tags = cls.tmp / "stuhl_tags.skp"
+        cls.tags_rc, out, err = cls._skptool("edit", str(STUHL), "--ops", json.dumps(TAG_OPS),
+                                             "-o", str(cls.stuhl_tags), "--blender", BLENDER, "-q")
+        cls.tags_log = out + err
         job = cls.tmp / "job.json"
-        job.write_text(json.dumps({"skp": str(STUHL), "skptool": str(cls.project), "out": str(cls.out)}),
-                       encoding="utf-8")
+        job.write_text(json.dumps({"skp": str(STUHL), "skptool": str(cls.project), "out": str(cls.out),
+                                   "skp_tags": str(cls.stuhl_tags)}), encoding="utf-8")
         t = time.time()
         r = subprocess.run([BLENDER, "-b", "--factory-startup", "--python-exit-code", "3", "--python",
                             str(ROOT / "tests" / "extension_in_blender.py"), "--", str(job)],
@@ -291,12 +326,16 @@ class ExtensionBlenderTest(unittest.TestCase):
         Path(purelib, "skptool_test_pakete.pth").write_text("\n".join(pakete) + "\n", encoding="utf-8")
         return proj
 
-    def skptool(self, *args):
-        env = dict(self.env, PYTHONPATH=str(self.project))
+    @classmethod
+    def _skptool(cls, *args):
+        env = dict(cls.env, PYTHONPATH=str(cls.project))
         r = subprocess.run([sys.executable, "-P", "-m", "skptool", *args], capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env, timeout=900, stdin=subprocess.DEVNULL,
-                           cwd=str(self.tmp))
+                           cwd=str(cls.tmp))
         return r.returncode, r.stdout, r.stderr
+
+    def skptool(self, *args):
+        return self._skptool(*args)
 
     def check(self):
         self.assertNotIn("crash", self.res, self.res.get("crash"))
@@ -376,6 +415,48 @@ class ExtensionBlenderTest(unittest.TestCase):
             sizes[name] = [s["width"], s["depth"], s["height"]]
         for a, b in zip(sizes["auswahl"], sizes["auswahl_cm"]):
             self.assertAlmostEqual(b, a / 100, delta=0.0006, msg=sizes)
+
+    def test_08_doppelter_import_ohne_001(self):
+        """Zweimal dieselbe Datei in eine Szene: vorhandene Tags, Materialien und Geometrie werden
+        weiterbenutzt, beim Export entstehen keine Tags "Layer0.001" und keine Komponenten "#2"."""
+        self.check()
+        self.assertEqual(self.tags_rc, 0, self.tags_log)
+        self.assertEqual(self.res["import_twice"], [["FINISHED"], ["FINISHED"]], self.log[-3000:])
+        self.assertEqual(self.res["empty_before_twice"]["objects"], [])
+        rc, out, err = self.skptool("list", str(self.stuhl_tags), "--json", "-q")
+        self.assertEqual(rc, 0, err)
+        summary = json.loads(out)["summary"]
+        st = self.res["after_twice"]
+        self.assertEqual(st["all_collections"], ["Chair", "Layer0", "Table"])
+        self.assertEqual([n for n in st["all_materials"] + st["all_meshes"] if SUFFIX.search(n)], [])
+        self.assertEqual(st["mesh_objects"], 2 * summary["objects"])
+        self.assertEqual(st["unique_meshes"], summary["unique_meshes"], "Geometrie wird geteilt")
+        self.assertEqual(self.res["export_twice"], ["FINISHED"], self.log[-3000:])
+        src, dup = skp_summary(self.stuhl_tags), skp_summary(self.out / "doppelt.skp")
+        self.assertEqual(sorted(src["layers"]), ["Chair", "Layer0", "Table"])
+        self.assertEqual(sorted(dup["layers"]), sorted(src["layers"]))
+        self.assertEqual(dup["materials"], src["materials"])
+        self.assertEqual(sorted(dup["definitions"]), sorted(src["definitions"]), "keine Komponenten mit #2")
+        self.assertEqual(dup["placed"], {k: 2 * v for k, v in src["placed"].items()},
+                         "jede Platzierung doppelt, auf ihrem Tag")
+        self.assertEqual(dup["faces_placed"], 2 * src["faces_placed"])
+
+    def test_09_dritter_import_mit_geaendertem_material(self):
+        """Walnut wurde in der Szene umgefaerbt: das Walnut des dritten Imports sieht anders aus und
+        bleibt ein eigenes Material ("Walnut_2"), Tags werden trotzdem zusammengelegt."""
+        self.check()
+        self.assertEqual(self.res["import_third"], ["FINISHED"], self.log[-3000:])
+        st = self.res["after_third"]
+        self.assertEqual(st["all_collections"], ["Chair", "Layer0", "Table"])
+        self.assertEqual([n for n in st["all_materials"] if SUFFIX.search(n)], ["Walnut.001"])
+        self.assertEqual(self.res["export_third"], ["FINISHED"], self.log[-3000:])
+        src, tri = skp_summary(self.stuhl_tags), skp_summary(self.out / "dreifach.skp")
+        self.assertEqual(sorted(tri["layers"]), sorted(src["layers"]))
+        self.assertEqual(tri["materials"]["Walnut"], [255, 0, 0])
+        self.assertEqual(tri["materials"]["Walnut_2"], src["materials"]["Walnut"])
+        self.assertEqual(sorted(set(tri["materials"]) - {"Walnut_2"}), sorted(src["materials"]))
+        self.assertEqual(tri["placed"], {k: 3 * v for k, v in src["placed"].items()})
+        self.assertTrue(any(n.endswith("#2") for n in tri["definitions"]), tri["definitions"])
 
     def test_99_echte_blender_einrichtung_unveraendert(self):
         after = snapshot(self.real)

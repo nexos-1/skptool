@@ -6,12 +6,26 @@ Format nach [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), Versionen 
 
 ### Noch offen (geplant für die nächsten Versionen)
 
-- **Farben im Slicer:** Die 3MF-Datei enthält Materialfarben, PrusaSlicer und OrcaSlicer zeigen sie aber nicht an. Dafür bräuchte es die Materials-Erweiterung von 3MF.
 - **Noch nicht in echten Programmen geprüft:** der MCP-Server in den Apps Claude Desktop und Claude Code selbst (geprüft mit MCP Inspector und offiziellem Python-SDK), der parallele Stapelbetrieb unter macOS mit echten Dateien.
 - **Noch nicht in SketchUp geprüft:** ob SketchUp die Tönung getönter Texturen aus dem 2017-Format anzeigt, ob Texte und Bemaßungen in Komponenten dort richtig erscheinen, die Lage von Texturen auf nach unten zeigenden Flächen und ausgeblendete Ebenen aus Dateien ab SketchUp 2021.
 - **Sehr alte Dateien** (SketchUp 3 bis 8) sind mit `skptool` mangels Testdateien nicht geprüft.
-- **Live-Tests unter Linux und macOS:** Die Zuordnung der selbst gestarteten Blender-Prozesse über `ps` ist dort nur mit einem Parser-Test geprüft, die Tests mit Blender-Fenster laufen nur unter Windows.
-- **Blender-Erweiterung:** Importiert man in eine Szene, die schon eine Collection „Layer0" hat, heißt die neue „Layer0.001" und wird beim Export ein eigener Tag.
+- **Live-Tests unter macOS:** Die Tests mit Blender-Fenster laufen unter Windows und Linux (Xvfb, auch in der CI), unter macOS nicht. Die Zuordnung der selbst gestarteten Blender-Prozesse über `ps` ist dort nur mit einem Parser-Test geprüft (unter Linux liest sie `/proc`, gegengeprüft mit `ps`).
+- **3MF in OrcaSlicer:** Teile mit mehreren Farben erscheinen in ihrer Hauptfarbe; Orcas Bemalung je Fläche wäre nicht spezifikationsgemäß.
+
+## [0.3.1] - 2026-09-24
+
+### Hinzugefügt
+
+- **3MF: Farben im Slicer.** Jede Farbe des Modells wird ein Filament (höchstens 16), PrusaSlicer bekommt sie als Bemalung je Fläche, OrcaSlicer je Teil; Texturen mit ihrer Durchschnittsfarbe. Beim Öffnen als Projekt zeigen PrusaSlicer 2.9.6 und OrcaSlicer 2.4.2 die SketchUp-Farben. Die Datei bleibt gültig nach dem XSD der 3MF-Spezifikation und in lib3mf (strenger Modus).
+- **Live-Modus unter Linux geprüft:** Die Tests mit echtem Blender-Fenster laufen jetzt auch unter Linux auf einem virtuellen Bildschirm (Xvfb), in der CI als eigener Job und in `tools/linux_e2e.sh` (neu: `--nur-live`).
+
+### Geändert
+
+- Live-Modus: Nur noch Befehle, die etwas ändern, lassen das Blender-Fenster neu zeichnen. Lesende Anfragen wie `--status` warten dadurch nicht mehr auf das Neuzeichnen (mit Software-OpenGL vorher 80 ms, jetzt 20 ms).
+
+### Behoben
+
+- **Blender-Erweiterung:** Wiederholter Import in dieselbe Szene legt keine „Layer0.001", „Walnut.001" oder „Bein.001" mehr an: vorhandene Tags, gleich aussehende Materialien und gleiche Geometrie werden weiterbenutzt. Beim Export werden Collections „X.001" zum Tag „X", bitgleiche Kopien „X.001" zur selben Komponente; anders aussehende Materialien behalten einen eigenen Namen („X_2").
 
 ## [0.3.0] - 2026-09-24
 

@@ -6,6 +6,8 @@ Die Live-Tests starten ein echtes Blender MIT Fenster (klein, ohne Fokus), weil 
 nur mit laufender Oberflaeche arbeiten. Am Ende wird Blender ueber den quit-Befehl beendet und
 notfalls hart abgebrochen. Ohne Blender werden sie uebersprungen.
 SKPTOOL_SKIP_GUI_TESTS=1 ueberspringt sie ebenfalls (z. B. auf Rechnern ohne Bildschirm).
+Linux ohne Bildschirm: mit virtuellem Bildschirm starten, xvfb-run -a python -m unittest tests.test_live -v
+(OpenGL dann als Software-Rendering aus Mesa; so laufen sie in der CI und in tools/linux_e2e.sh).
 """
 import io
 import json
@@ -43,6 +45,9 @@ QUIT_TIMEOUT = 180
 # Mit BUSY_INTERVAL 0,1 s war das schnellste Abholen 83 ms, unter Last einmal 50 ms (Last verschiebt
 # den Takt zufaellig). Unter Last ist die Zeitmessung also kein sicherer Waechter, dafuer gibt es
 # zusaetzlich test_timer_intervals_stay_short.
+# Linux unter Xvfb (Docker, 16 Kerne, Software-OpenGL): lesende Anfragen 20 ms Abholen (ein BUSY_INTERVAL),
+# nach einer Aenderung 50 bis 130 ms, weil Blender vorher das Fenster neu zeichnet. Deshalb die
+# Wiederholung mit lesenden Anfragen unten. Bis 0.3.0 zeichnete jeder Auftrag neu, dann lag auch ping bei 80 ms.
 INSIDE_MS = 100
 PICKUP_MS = 40
 
@@ -111,14 +116,51 @@ def _parse_ps(text):
     return table
 
 
+def _read_proc(root="/proc"):
+    """Linux: Prozesse direkt aus /proc lesen -> {pid: (ppid, name, befehlszeile)}.
+    Schlanke Container (python:*-slim) haben kein ps, /proc gibt es dagegen immer. Die Eltern-PID
+    steht in /proc/<pid>/stat hinter dem Programmnamen in Klammern; der Name darf selbst Leerzeichen
+    und Klammern enthalten, deshalb wird ab der LETZTEN schliessenden Klammer gelesen. Die
+    Befehlszeile steht mit NUL getrennt in /proc/<pid>/cmdline (leer bei Kernel-Threads).
+    Prozesse, die waehrend des Lesens enden, fehlen einfach."""
+    table = {}
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return table
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        base = os.path.join(root, entry)
+        try:
+            with open(os.path.join(base, "stat"), "rb") as fh:
+                stat_line = fh.read().decode("utf-8", "replace")
+            with open(os.path.join(base, "cmdline"), "rb") as fh:
+                raw = fh.read()
+        except OSError:  # gerade beendet oder nicht lesbar
+            continue
+        start, end = stat_line.find("("), stat_line.rfind(")")
+        fields = stat_line[end + 1:].split()
+        if start < 0 or end < start or len(fields) < 2 or not fields[1].isdigit():
+            continue
+        args = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+        cmd = " ".join(args)
+        name = os.path.basename(args[0]) if args else stat_line[start + 1:end]
+        table[int(entry)] = (int(fields[1]), name, cmd)
+    return table
+
+
 def _process_table():
     """Alle Prozesse des Rechners als {pid: (ppid, name, befehlszeile)}, ohne neue Abhaengigkeiten.
-    Windows: Get-CimInstance (wmic gibt es auf neuen Windows-Versionen nicht mehr), sonst ps."""
+    Windows: Get-CimInstance (wmic gibt es auf neuen Windows-Versionen nicht mehr), Linux: /proc,
+    sonst (macOS) ps."""
     if os.name == "nt":
         out = subprocess.run([_POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", _PS_QUERY],
                              capture_output=True, timeout=120, check=True,
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
         return _parse_cim_json(out.decode("utf-8", "replace"))
+    if sys.platform.startswith("linux") and os.path.isdir("/proc/self"):
+        return _read_proc()
     out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, timeout=60,
                          check=True).stdout
     return _parse_ps(out.decode("utf-8", "replace"))
@@ -305,6 +347,40 @@ class TestClientWithoutBlender(unittest.TestCase):
         table = _process_table()  # echter Aufruf: der eigene Prozess muss darin stehen
         self.assertIn(os.getpid(), table)
         self.assertEqual(table[os.getpid()][0], os.getppid())
+
+    def test_proc_reader(self):
+        """/proc-Leser (Linux ohne ps) mit einem nachgebauten /proc, laeuft auf jedem System."""
+        fake = self.tmp / "proc"
+
+        def proc(pid, stat_line, cmdline):
+            d = fake / str(pid)
+            d.mkdir(parents=True)
+            (d / "stat").write_bytes(stat_line)
+            (d / "cmdline").write_bytes(cmdline)
+
+        proc(1, b"1 (systemd) S 0 1 1 0 -1", b"/sbin/init\0splash\0")
+        proc(4711, b"4711 (blender) S 1 4711 1 0 -1", b"/opt/blender/blender\0-b\0/tmp/a b.blend\0")
+        proc(42, b"42 (x) y (z)) R 4711 42 1 0", b"")          # Name mit Leerzeichen und Klammern
+        proc(2, b"2 (kthreadd) S 0 0 0 0", b"")                # Kernel-Thread ohne Befehlszeile
+        proc(9, b"kaputt", b"x\0")                              # unlesbar: wird uebersprungen
+        (fake / "7").mkdir()                                    # Prozess waehrend des Lesens beendet
+        (fake / "self").mkdir()                                 # keine PID
+        self.assertEqual(_read_proc(str(fake)), {
+            1: (0, "init", "/sbin/init splash"),
+            4711: (1, "blender", "/opt/blender/blender -b /tmp/a b.blend"),
+            42: (4711, "x) y (z)", ""),
+            2: (0, "kthreadd", "")})
+        self.assertEqual(_read_proc(str(self.tmp / "gibt_es_nicht")), {})
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("ps"), "nur Linux mit ps")
+    def test_proc_reader_matches_ps(self):
+        """Gegenprobe auf echtem Linux: /proc und ps sehen den eigenen Prozess gleich."""
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, timeout=60,
+                             check=True).stdout.decode("utf-8", "replace")
+        via_ps, via_proc = _parse_ps(out), _read_proc()
+        me = os.getpid()
+        self.assertEqual(via_proc[me][:2], via_ps[me][:2])
+        self.assertEqual(via_proc[me][2].split()[0], via_ps[me][2].split()[0])
 
     def test_no_em_dash_in_live_files(self):
         for p in (ROOT / "skptool" / "live.py", ROOT / "skptool" / "blender_scripts" / "live_server.py",
@@ -525,6 +601,26 @@ class TestLiveBlender(unittest.TestCase):
         self.fail(f"Keine von {len(pickup)} Anfragen wurde schneller als {PICKUP_MS} ms abgeholt, bei geringer "
                   f"Streuung ({spread:.0f} ms): der Timer im Live-Server pollt zu langsam. "
                   f"Werte: {[round(v) for v in pickup]}")
+
+    def test_02b_read_only_requests_do_not_redraw(self):
+        """Nur Befehle, die etwas aendern, lassen das Fenster neu zeichnen. Frueher zeichnete jeder
+        Auftrag neu; mit Software-OpenGL (Linux unter Xvfb) hielt das jede folgende Anfrage 55 bis
+        70 ms auf, auch ping und status, und test_02_latency schlug fehl."""
+        live.wait_for_export(self.state, timeout=300)  # ein fertiger Export zeichnet auch neu
+        n0 = live.status(self.state)["redraws"]
+        live.ping(self.state)
+        live.run_ops([{"op": "list", "select": {"name": "Kiste"}},
+                      {"op": "measure", "select": {"name": "Kiste"}, "to_object": {"name": "Wuerfel"}}],
+                     self.state)
+        live.run_ops([{"op": "move", "select": {"name": "GibtEsNicht"}, "by": [1, 0, 0]}], self.state)
+        n1 = live.status(self.state)["redraws"]
+        self.assertEqual(n1, n0, "nur lesende Anfragen haben neu zeichnen lassen")
+        live.run_ops([{"op": "move", "select": {"name": "Kiste"}, "by": [0, 0, 1]}], self.state)
+        n2 = live.status(self.state)["redraws"]
+        self.assertGreater(n2, n1, "eine Aenderung muss neu zeichnen lassen")
+        live.undo(1, self.state)
+        self.assertGreater(live.status(self.state)["redraws"], n2, "undo muss neu zeichnen lassen")
+        self.assertEqual(self.center("Kiste"), [3.0, 0.0, 0.5])
 
     def test_03_ops_move_and_undo(self):
         self.assertEqual(self.center("Wuerfel"), [0.0, 0.0, 0.5])

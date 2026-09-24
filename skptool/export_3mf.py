@@ -35,7 +35,26 @@ Rueckseite umgekehrt gewunden). Fuer den Druck ergaebe das zwei deckungsgleiche 
 Volumen, deshalb bleibt je Flaeche nur die Vorderseite (siehe drop_back_sides). Die 3MF hat daher
 weniger Dreiecke als die GLB: Dreiecke 3MF + entfernte Rueckseiten = Dreiecke GLB.
 
-Texturen werden nicht geschrieben (nur die Grundfarbe des Materials).
+Farben: basematerials (Core-Spezifikation) tragen die Farbe jedes Materials, jedes Dreieck verweist
+darauf. Texturen werden nicht geschrieben, Texturmaterialien bekommen die Durchschnittsfarbe ihres
+Bildes. Keiner der beiden Slicer liest basematerials (PrusaSlicer 2.9.6 src/libslic3r/Format/3mf.cpp
+_handle_start_triangle ignoriert pid/p1, OrcaSlicer 2.4.2 bbs_3mf.cpp ebenso und kennt nur
+m:colorgroup je Objekt als Extrudernummer). Beide zeigen ein Modell immer in den Farben der
+Filamente, die ihm zugeordnet sind. Deshalb, sobald das Modell mindestens zwei Farben hat:
+  - jede Farbe wird ein Filament (hoechstens MAX_FILAMENTE, sonst aehnliche Farben zusammengefasst,
+    Filament 1 = groesste Flaeche),
+  - PrusaSlicer: je Dreieck slic3rpe:mmu_segmentation (Bemalung, Attribut im eigenen Namensraum, also
+    XSD-gueltig) und Metadata/Slic3r_PE.config mit den Filamentfarben,
+  - OrcaSlicer: Metadata/model_settings.config ordnet jedem Teil das Filament seiner groessten Farbe zu,
+    Metadata/project_settings.config traegt die Filamentfarben (dazu filament_diameter und
+    filament_is_support in gleicher Anzahl, sonst bricht die Befehlszeile von OrcaSlicer 2.4.2 mit
+    Code -5 ab). Orcas Bemalung je Dreieck (Attribut paint_color ohne Namensraum) waere nicht
+    spezifikationsgemaess (lib3mf lehnt sie im strengen Modus ab), Teile mit mehreren Farben bekommen
+    in Orca deshalb das Filament ihrer Hauptfarbe.
+Die Filamentfarben laden beide Slicer nur beim Oeffnen als Projekt (PrusaSlicer fragt nach, OrcaSlicer
+warnt vor "benutzerdefinierten Profilen"). Dabei ersetzen sie die Druckereinstellungen durch ihre
+Standardwerte, danach den eigenen Drucker waehlen. Beim reinen Import der Geometrie bleiben Bemalung
+und Zuordnung, die Farben kommen dann von den eigenen Filamenten.
 Netze werden nicht repariert. Offene oder uneinheitlich orientierte Netze meldet write_3mf als
 Hinweis, damit klar ist, warum ein Slicer sich beschwert.
 """
@@ -54,13 +73,19 @@ from skptool import __version__
 from skptool.gltf_writer import MAX_NODES, _material_names
 
 MODEL_NS = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+SLIC3RPE_NS = "http://schemas.slic3r.org/3mf/2017/06"  # Namensraum der PrusaSlicer-Attribute
 MODEL_PATH = "3D/3dmodel.model"
-CONTENT_TYPES = (
+PRUSA_CONFIG = "Metadata/Slic3r_PE.config"          # PrusaSlicer: Projekteinstellungen (INI)
+ORCA_PROJECT = "Metadata/project_settings.config"   # OrcaSlicer/Bambu: Projekteinstellungen (JSON)
+ORCA_MODEL = "Metadata/model_settings.config"       # OrcaSlicer/Bambu: Einstellungen je Objekt/Teil
+MAX_FILAMENTE = 16  # Bemalungscode mit 4 Bit (OrcaSlicer kennt nur so viele), kaum ein Drucker hat mehr
+_DUESE_MM, _FILAMENT_MM = "0.4", "1.75"  # nur fuer die Anzahl, Werte wie die Standardwerte der Slicer
+CONTENT_TYPES_HEAD = (
     '<?xml version="1.0" encoding="UTF-8"?>\n'
     '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
     '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-    '<Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>'
-    '</Types>\n')
+    '<Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>')
+_CONFIG_TYPES = {PRUSA_CONFIG: "text/plain", ORCA_PROJECT: "application/json", ORCA_MODEL: "application/xml"}
 RELS = (
     '<?xml version="1.0" encoding="UTF-8"?>\n'
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
@@ -118,6 +143,98 @@ def _displaycolor(rgba) -> str:
     if len(out) > 3 and out[3] < 255:
         text += "%02X" % out[3]
     return text
+
+
+def material_rgba(model, isc, materials) -> list[tuple]:
+    """Farbe (r, g, b, a als 0..1) je Material fuer die 3MF. Texturmaterialien: Durchschnittsfarbe des
+    Bildes (wie SketchUps avgColor, einfaerben.texture_average), getoente Texturen die Zielfarbe,
+    unlesbare Bilder die Materialfarbe."""
+    from skptool import einfaerben
+    from skptool.gltf_writer import _image_ok
+
+    colorized = {mt.name for mt in model.materials if getattr(mt, "colorized", False)}
+    averages: dict = {}
+    out = []
+    for i, m in enumerate(materials):
+        rgba = list(m["pbrMetallicRoughness"].get("baseColorFactor", (1, 1, 1, 1)))
+        rgba += [1.0] * (4 - len(rgba))
+        gm = isc.gltf_materials[i] if i < len(isc.gltf_materials) else {}
+        tex_ref = gm.get("pbrMetallicRoughness", {}).get("baseColorTexture")
+        if tex_ref is not None and m["name"] not in colorized:
+            ti = tex_ref.get("index")
+            if ti not in averages:
+                tex = isc.textures[ti] if isinstance(ti, int) and 0 <= ti < len(isc.textures) else None
+                data = getattr(tex, "data", None)
+                averages[ti] = einfaerben.texture_average(data) if data and _image_ok(data) else None
+            if averages[ti] is not None:
+                rgba[:3] = [c / 255.0 for c in averages[ti]]
+        out.append(tuple(rgba[:4]))
+    return out
+
+
+def paint_code(filament: int) -> str:
+    """Bemalung eines ungeteilten Dreiecks mit Filament 1..16 wie PrusaSlicer/OrcaSlicer sie speichern
+    (TriangleSelector::serialize, FacetsAnnotation::get_triangle_as_string): 2 Bit "nicht geteilt",
+    dann der Zustand; ab 3 mit Kennung 0b11 und 4 Bit (Zustand - 3), Hex-Ziffern rueckwaerts."""
+    if not 1 <= filament <= MAX_FILAMENTE:
+        raise ValueError(f"Filament {filament} ausserhalb 1..{MAX_FILAMENTE}")
+    return "%X" % (filament << 2) if filament < 3 else "%XC" % (filament - 3)
+
+
+def filamente(flaechen: dict, reihenfolge: dict, limit: int = MAX_FILAMENTE):
+    """Filamente aus den Farben (#RRGGBB -> Flaeche in mm2, reihenfolge: erstes Auftreten).
+    Filament 1 hat die groesste Flaeche. Mehr als limit Farben: die kleinsten gehen auf die naechste
+    behaltene Farbe (Abstand im RGB-Raum). Rueckgabe (Farbliste, {Farbe: Filamentnummer 1..n})."""
+    order = sorted(flaechen, key=lambda c: (-round(flaechen[c], 6), reihenfolge[c], c))
+    kept = order[:limit]
+
+    def rgb(c):
+        return (int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16))
+
+    nummer = {c: i + 1 for i, c in enumerate(kept)}
+    for c in order[limit:]:
+        a = rgb(c)
+        best = min(range(len(kept)), key=lambda i: (sum((x - y) ** 2 for x, y in zip(a, rgb(kept[i]))), i))
+        nummer[c] = best + 1
+    return kept, nummer
+
+
+def prusa_config(farben: list[str]) -> str:
+    """Metadata/Slic3r_PE.config: nur, was fuer die Farben noetig ist. PrusaSlicer legt die Anzahl der
+    Extruder ueber nozzle_diameter und filament_diameter fest, alles andere bleibt Standard."""
+    n = len(farben)
+    zeilen = [f"; generated by skptool {__version__}",
+              "; extruder_colour = " + ";".join(farben),
+              "; filament_colour = " + ";".join(farben),
+              "; filament_diameter = " + ",".join([_FILAMENT_MM] * n),
+              "; nozzle_diameter = " + ",".join([_DUESE_MM] * n)]
+    return "\n".join(zeilen) + "\n"
+
+
+def orca_project(farben: list[str]) -> str:
+    """Metadata/project_settings.config (JSON) mit den Filamentfarben fuer OrcaSlicer/Bambu Studio.
+    Die Befehlszeile von OrcaSlicer verlangt filament_is_support in derselben Anzahl wie
+    filament_colour (OrcaSlicer.cpp, "filament_is_support's count ... not equal")."""
+    import json
+    n = len(farben)
+    return json.dumps({"filament_colour": farben, "filament_diameter": [_FILAMENT_MM] * n,
+                       "filament_is_support": ["0"] * n}, indent=4) + "\n"
+
+
+def orca_model_settings(obj_id: int, name: str, teile: list[tuple[int, str, int]]) -> str:
+    """Metadata/model_settings.config: Filament je Teil (Komponente) der Baugruppe fuer OrcaSlicer.
+    teile: (Objekt-id des Netzes, Name, Filament) in der Reihenfolge der Komponenten."""
+    out = ['<?xml version="1.0" encoding="UTF-8"?>\n<config>\n',
+           f'  <object id="{obj_id}">\n',
+           f'    <metadata key="name" value="{xml_attr(name)}"/>\n',
+           '    <metadata key="extruder" value="1"/>\n']
+    for oid, teilname, fil in teile:
+        out.append(f'    <part id="{oid}" subtype="normal_part">\n'
+                   f'      <metadata key="name" value="{xml_attr(teilname)}"/>\n'
+                   f'      <metadata key="extruder" value="{fil}"/>\n'
+                   '    </part>\n')
+    out.append("  </object>\n</config>\n")
+    return "".join(out)
 
 
 def _welded_mesh(res):
@@ -311,7 +428,8 @@ def centered(verts: np.ndarray):
     return np.round(rounded - c, VERT_DIGITS), c
 
 
-def _mesh_xml(obj_id: int, name: str, verts, tris, mats, pid: int) -> list[str]:
+def _mesh_xml(obj_id: int, name: str, verts, tris, mats, pid: int, paint=None) -> list[str]:
+    """paint: None oder je Material der Bemalungscode fuer PrusaSlicer (slic3rpe:mmu_segmentation)."""
     default = int(mats[0]) if len(mats) else 0
     head = (f'<object id="{obj_id}" type="model" name="{xml_attr(name)}" pid="{pid}" pindex="{default}">'
             "<mesh><vertices>")
@@ -320,12 +438,19 @@ def _mesh_xml(obj_id: int, name: str, verts, tris, mats, pid: int) -> list[str]:
     out += [f'<vertex x="{_num(x)}" y="{_num(y)}" z="{_num(z)}"/>' for x, y, z in rounded]
     out.append("</vertices><triangles>")
     for (v1, v2, v3), m in zip(tris.tolist(), mats.tolist()):
-        if m == default:
-            out.append(f'<triangle v1="{v1}" v2="{v2}" v3="{v3}"/>')
-        else:
-            out.append(f'<triangle v1="{v1}" v2="{v2}" v3="{v3}" pid="{pid}" p1="{m}"/>')
+        extra = "" if m == default else f' pid="{pid}" p1="{m}"'
+        if paint is not None:
+            extra += f' slic3rpe:mmu_segmentation="{paint[m]}"'
+        out.append(f'<triangle v1="{v1}" v2="{v2}" v3="{v3}"{extra}/>')
     out.append("</triangles></mesh></object>")
     return out
+
+
+def _flaechen(verts, tris) -> np.ndarray:
+    if not len(tris):
+        return np.zeros(0)
+    v = verts[tris]
+    return np.linalg.norm(np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]), axis=1) / 2.0
 
 
 def _placements(isc, max_components: int):
@@ -374,6 +499,7 @@ def write_3mf(model, isc, out: Path, max_components: int = 5_000_000, warn=None)
             print(f"Hinweis: {text}", file=sys.stderr, flush=True)
 
     materials = _material_names(model, isc, textures=False, fallback_names=True)
+    rgba = material_rgba(model, isc, materials)
     placements = _placements(isc, max_components)
     if not placements:
         raise ValueError("Keine Flaechen im Modell, 3MF braucht mindestens ein Netz. Nichts geschrieben.")
@@ -384,28 +510,17 @@ def write_3mf(model, isc, out: Path, max_components: int = 5_000_000, warn=None)
              "source_triangles": 0, "kept_triangles": 0,
              "mirrored_variants": 0, "degenerate_dropped": 0, "skipped_placements": 0,
              "back_sides_dropped": 0, "back_sides_unclear": 0, "placed_back_sides_dropped": 0,
-             "materials": len(materials), "open_objects": 0, "checked_objects": 0, "problems": []}
+             "materials": len(materials), "open_objects": 0, "checked_objects": 0, "problems": [],
+             "colors": 0, "filaments": [], "colors_merged": 0}
     res_by_id = {r.id: r for r in isc.mesh_resources}
     base_pid = 1
-    chunks = [
-        '<?xml version="1.0" encoding="UTF-8"?>\n',
-        f'<model unit="millimeter" xml:lang="en-US" xmlns="{MODEL_NS}">',
-        f'<metadata name="Application">{xml_attr("skptool " + __version__)}</metadata>',
-        f'<metadata name="Title">{xml_attr(Path(out).stem)}</metadata>',
-        f'<resources><basematerials id="{base_pid}">',
-    ]
-    chunks += [f'<base name="{xml_attr(m["name"])}" displaycolor="'
-               f'{_displaycolor(m["pbrMetallicRoughness"].get("baseColorFactor", (1, 1, 1, 1)))}"/>'
-               for m in materials]
-    if not materials:
-        chunks.append('<base name="SketchUp_Standard" displaycolor="#DBDBD6"/>')
-    chunks.append("</basematerials>")
 
+    # 1. Durchgang: Netze und Platzierungen sammeln (die Filamente haengen von allen Flaechen ab)
     next_id = base_pid + 1
-    objects: dict = {}  # (resource_id, gespiegelt) -> (objekt-id, Dreiecke)
+    objects: dict = {}  # (resource_id, gespiegelt) -> dict(id, name, verts, tris, mats, center, uses)
     meshes: dict = {}   # resource_id -> (verts, tris, mats) oder None
     back_count: dict = {}  # resource_id -> entfernte Rueckseiten-Dreiecke
-    components = []
+    components = []     # (objekt-id, XML)
     for res_id, world in placements:
         if res_id not in meshes:
             res = res_by_id.get(res_id)
@@ -451,31 +566,83 @@ def write_3mf(model, isc, out: Path, max_components: int = 5_000_000, warn=None)
             if len(mats) and (mats.min() < 0 or mats.max() >= max(len(materials), 1)):
                 raise ValueError(f"Netz {res_id}: Materialindex ausserhalb der Materialliste")
             verts, center = centered(verts)
-            chunks += _mesh_xml(next_id, name, verts, tris, mats, base_pid)
-            objects[key] = (next_id, len(tris), center)
+            objects[key] = {"id": next_id, "name": name, "verts": verts, "tris": tris, "mats": mats,
+                            "center": center, "uses": 0}
             stats["mesh_objects"] += 1
             stats["triangles"] += len(tris)
             next_id += 1
-        obj_id, ntris, center = objects[key]
+        obj = objects[key]
+        obj["uses"] += 1
         if mirrored:
             lin = lin @ _MIRROR  # Netz ist schon gespiegelt, Matrix bekommt positive Determinante
-        t = t + lin @ center  # Netz liegt um seine Mitte, siehe centered()
+        t = t + lin @ obj["center"]  # Netz liegt um seine Mitte, siehe centered()
         ident = np.allclose(lin, np.eye(3), rtol=0, atol=1e-12) and np.allclose(t, 0, rtol=0, atol=1e-9)
         tr = "" if ident else f' transform="{_transform(lin, t)}"'
-        components.append(f'<component objectid="{obj_id}"{tr}/>')
-        stats["placed_triangles"] += ntris
+        components.append((obj["id"], f'<component objectid="{obj["id"]}"{tr}/>'))
+        stats["placed_triangles"] += len(obj["tris"])
         stats["placed_back_sides_dropped"] += back_count.get(res_id, 0)
     if not components:
         raise ValueError("Keine druckbare Geometrie im Modell, nichts geschrieben.")
     stats["components"] = len(components)
+
+    # 2. Farben: sichtbare Farbe je Material (ohne Alpha), Flaeche aller Platzierungen je Farbe
+    hexes = [_displaycolor(c)[:7] for c in rgba] or ["#DBDBD6"]
+    flaeche: dict = {}
+    zuerst: dict = {}
+    for obj in objects.values():
+        obj["area"] = _flaechen(obj["verts"], obj["tris"])
+        for m, a in zip(obj["mats"].tolist(), obj["area"].tolist()):
+            c = hexes[m]
+            zuerst.setdefault(c, len(zuerst))
+            flaeche[c] = flaeche.get(c, 0.0) + a * obj["uses"]
+    stats["colors"] = len(flaeche)
+    paint = None
+    if len(flaeche) >= 2:
+        farben, nummer = filamente(flaeche, zuerst)
+        stats["filaments"] = farben
+        stats["colors_merged"] = len(flaeche) - len(farben)
+        paint = [paint_code(nummer[c]) if c in nummer else "" for c in hexes]
+
+    # 3. Modell schreiben
+    ns = f' xmlns:slic3rpe="{SLIC3RPE_NS}"' if paint is not None else ""
+    chunks = [
+        '<?xml version="1.0" encoding="UTF-8"?>\n',
+        f'<model unit="millimeter" xml:lang="en-US" xmlns="{MODEL_NS}"{ns}>',
+        f'<metadata name="Application">{xml_attr("skptool " + __version__)}</metadata>',
+        f'<metadata name="Title">{xml_attr(Path(out).stem)}</metadata>',
+        f'<resources><basematerials id="{base_pid}">',
+    ]
+    chunks += [f'<base name="{xml_attr(m["name"])}" displaycolor="{_displaycolor(c)}"/>'
+               for m, c in zip(materials, rgba)]
+    if not materials:
+        chunks.append('<base name="SketchUp_Standard" displaycolor="#DBDBD6"/>')
+    chunks.append("</basematerials>")
+    teile = {}  # objekt-id -> (Name, Filament der groessten Farbe) fuer OrcaSlicer
+    for obj in objects.values():
+        chunks += _mesh_xml(obj["id"], obj["name"], obj["verts"], obj["tris"], obj["mats"], base_pid, paint)
+        if paint is not None:
+            je_filament: dict = {}
+            for m, a in zip(obj["mats"].tolist(), obj["area"].tolist()):
+                f = nummer[hexes[m]]
+                je_filament[f] = je_filament.get(f, 0.0) + a
+            haupt = min(je_filament, key=lambda f: (-round(je_filament[f], 6), f))
+            teile[obj["id"]] = (obj["name"], haupt)
     assembly = next_id
-    chunks.append(f'<object id="{assembly}" type="model" name="{xml_attr(Path(out).stem)}"><components>')
-    chunks += components
+    title = Path(out).stem
+    chunks.append(f'<object id="{assembly}" type="model" name="{xml_attr(title)}"><components>')
+    chunks += [xml for _oid, xml in components]
     chunks.append(f'</components></object></resources><build><item objectid="{assembly}"/></build></model>\n')
 
-    _write_zip_atomic(out, [("[Content_Types].xml", CONTENT_TYPES.encode("utf-8")),
-                            ("_rels/.rels", RELS.encode("utf-8")),
-                            (MODEL_PATH, "".join(chunks).encode("utf-8"))])
+    parts = [("_rels/.rels", RELS.encode("utf-8")), (MODEL_PATH, "".join(chunks).encode("utf-8"))]
+    if paint is not None:
+        orca_teile = [(oid, teile[oid][0], teile[oid][1]) for oid, _xml in components]
+        parts += [(PRUSA_CONFIG, prusa_config(farben).encode("utf-8")),
+                  (ORCA_PROJECT, orca_project(farben).encode("utf-8")),
+                  (ORCA_MODEL, orca_model_settings(assembly, title, orca_teile).encode("utf-8"))]
+    types = CONTENT_TYPES_HEAD + "".join(
+        f'<Override PartName="/{name}" ContentType="{_CONFIG_TYPES[name]}"/>'
+        for name, _data in parts if name in _CONFIG_TYPES) + "</Types>\n"
+    _write_zip_atomic(out, [("[Content_Types].xml", types.encode("utf-8"))] + parts)
 
     for text in stats["problems"][:MAX_WARN_LINES]:
         warn(text)
@@ -491,4 +658,7 @@ def write_3mf(model, isc, out: Path, max_components: int = 5_000_000, warn=None)
              "eindeutig, beide Seiten wurden behalten")
     if stats["skipped_placements"]:
         warn(f"3MF: {stats['skipped_placements']} auf Groesse null skalierte Platzierungen weggelassen")
+    if stats["colors_merged"]:
+        warn(f"3MF: {stats['colors']} Farben, fuer die Slicer auf {len(stats['filaments'])} Filamente "
+             "zusammengefasst (aehnliche Farben teilen sich ein Filament)")
     return stats
